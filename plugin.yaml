@@ -1,15 +1,16 @@
 name: telegram-canonical-bridge
 label: Telegram Canonical Bridge
 kind: platform
-version: 0.1.0
-description: 將 Telegram 私訊轉送至指定 Hermes Controller 的 canonical Bot Chat。
-author: Local
-requires_env:
-  - name: TELEGRAM_CANONICAL_BRIDGE_BOT_TOKEN
-    description: Telegram Bot API token
-    prompt: Telegram Bot Token
-    password: true
-  - name: TELEGRAM_CANONICAL_BRIDGE_BACKEND_TOKEN
-    description: Hermes serve 後端的工作階段 token；建議與 HERMES_DASHBOARD_SESSION_TOKEN 使用同一值
-    prompt: Hermes Backend Token
-    password: true
+version: 0.2.0
+description: 將 Telegram 私訊轉送至指定 Hermes Controller 的 canonical Bot Chat，並追蹤 message_agent 任務。
+author: hi18aa
+provides_tools:
+  - bridge_task_update
+  - bridge_task_inbox
+  - bridge_task_status
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end

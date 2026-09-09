@@ -19,6 +19,10 @@ class FakeBackend:
             {"_row_id": "old", "role": "assistant", "content": "啟動前既有回覆"},
         ]
         self.prompts: list[str] = []
+        self.events: list[dict[str, Any]] = []
+        self.latest_seq = 0
+        self.processes: list[dict[str, Any]] = []
+        self.processes_by_session: dict[str, list[dict[str, Any]]] = {}
 
 
 class FakeRpc:
@@ -48,6 +52,20 @@ class FakeRpc:
         if method == "prompt.submit":
             self.backend.prompts.append(str(data["text"]))
             return {"accepted": True}
+        if method == "session.events.since":
+            return {
+                "events": self.backend.events,
+                "latest_seq": self.backend.latest_seq,
+                "truncated": False,
+                "count": len(self.backend.events),
+                "epoch": "fake-epoch",
+            }
+        if method == "process.list":
+            return {
+                "processes": self.backend.processes_by_session.get(
+                    str(data.get("session_id") or ""), self.backend.processes
+                )
+            }
         raise AssertionError(f"unexpected RPC method: {method}")
 
 
@@ -102,6 +120,82 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_replay_ack_and_process_list_update_task_without_resuming_session(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                config = BridgeConfig(
+                    bot_token="telegram-token",
+                    backend_token="backend-token",
+                    backend_url="ws://127.0.0.1:9119/api/ws",
+                    controller_profile="default",
+                    allowed_user_ids=("20",),
+                    state_path=Path(directory) / "bridge.sqlite3",
+                    home_chat_id=None,
+                    telegram_poll_timeout_seconds=40,
+                    history_poll_interval_seconds=3,
+                    rpc_timeout_seconds=25,
+                    retry_base_seconds=1,
+                    retry_max_seconds=10,
+                )
+                backend = FakeBackend()
+                state = BridgeState(config.state_path)
+                state.set_canonical_binding(
+                    controller_profile="default",
+                    root_id="root-bot-chat",
+                    runtime_id="runtime-bot-chat",
+                )
+                task, _created = state.create_task(
+                    chat_id="10",
+                    origin_profile="default",
+                    origin_session_id="runtime-bot-chat",
+                    origin_turn_id="turn-1",
+                    origin_tool_call_id="tool-1",
+                    target="operitrace-agent",
+                )
+                backend.events = [{
+                    "type": "tool.complete",
+                    "session_id": "runtime-bot-chat",
+                    "payload": {
+                        "name": "message_agent",
+                        "tool_id": "tool-1",
+                        "result": {
+                            "status": "sent",
+                            "process_id": "process-1",
+                        },
+                    },
+                }]
+                backend.latest_seq = 1
+                backend.processes = [{
+                    "session_id": "process-1",
+                    "status": "running",
+                    "exit_code": None,
+                }]
+                service = CanonicalBridgeService(
+                    config,
+                    state,
+                    rpc_factory=lambda _url, _token, _timeout: FakeRpc(backend),  # type: ignore[arg-type]
+                )
+
+                self.assertGreaterEqual(await service.sync_task_telemetry(), 1)
+                running = state.task(task.id)
+                self.assertEqual(running.process_id, "process-1")
+                self.assertEqual(running.status, "running")
+                self.assertNotIn("session.resume", [method for method, _ in backend.calls])
+
+                backend.events = []
+                backend.latest_seq = 2
+                backend.processes[0] = {
+                    "session_id": "process-1",
+                    "status": "exited",
+                    "exit_code": 0,
+                }
+                self.assertEqual(await service.sync_task_telemetry(), 1)
+                completed = state.task(task.id)
+                self.assertEqual(completed.status, "completed")
+                self.assertEqual(completed.exit_code, 0)
+
+        asyncio.run(scenario())
+
     def test_ambiguous_prompt_submit_is_not_blindly_retried(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
@@ -125,6 +219,58 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 ))
                 self.assertEqual(service.status()["uncertain_inbound"], 1)
                 self.assertEqual(await service.retry_due_inbound(), 0)
+
+        asyncio.run(scenario())
+
+    def test_process_polling_uses_nested_task_origin_session(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                config = BridgeConfig(
+                    bot_token="telegram-token", backend_token="backend-token",
+                    backend_url="ws://127.0.0.1:9119/api/ws", controller_profile="default",
+                    allowed_user_ids=("20",), state_path=Path(directory) / "bridge.sqlite3",
+                    home_chat_id=None, telegram_poll_timeout_seconds=40,
+                    history_poll_interval_seconds=3, rpc_timeout_seconds=25,
+                    retry_base_seconds=1, retry_max_seconds=10,
+                )
+                backend = FakeBackend()
+                state = BridgeState(config.state_path)
+                state.set_canonical_binding(
+                    controller_profile="default",
+                    root_id="root-bot-chat",
+                    runtime_id="runtime-bot-chat",
+                )
+                nested, _created = state.create_task(
+                    chat_id="10",
+                    origin_profile="worker-a",
+                    origin_session_id="worker-canonical-session",
+                    origin_turn_id="worker-turn",
+                    origin_tool_call_id="nested-tool",
+                    target="worker-b",
+                )
+                state.acknowledge_dispatch(
+                    session_id="worker-canonical-session",
+                    tool_call_id="nested-tool",
+                    process_id="nested-process",
+                )
+                backend.processes_by_session["worker-canonical-session"] = [{
+                    "session_id": "nested-process",
+                    "status": "exited",
+                    "exit_code": 0,
+                }]
+                service = CanonicalBridgeService(
+                    config,
+                    state,
+                    rpc_factory=lambda _url, _token, _timeout: FakeRpc(backend),  # type: ignore[arg-type]
+                )
+
+                self.assertEqual(await service.sync_task_telemetry(), 1)
+                self.assertEqual(state.task(nested.id).status, "completed")
+                process_calls = [
+                    params["session_id"]
+                    for method, params in backend.calls if method == "process.list"
+                ]
+                self.assertIn("worker-canonical-session", process_calls)
 
         asyncio.run(scenario())
 

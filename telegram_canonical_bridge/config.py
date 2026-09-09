@@ -1,6 +1,6 @@
 """外掛設定與秘密讀取。
 
-非秘密值只讀取 ``gateway.platforms.telegram_canonical_bridge.extra``；
+非秘密值只讀取 ``platforms.telegram_canonical_bridge.extra``；
 Bot token 與 Hermes 後端 token 只從 Hermes 的秘密範圍讀取。
 """
 
@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 BOT_TOKEN_ENV = "TELEGRAM_CANONICAL_BRIDGE_BOT_TOKEN"
 BACKEND_TOKEN_ENV = "TELEGRAM_CANONICAL_BRIDGE_BACKEND_TOKEN"
+STATE_PATH_ENV = "TELEGRAM_CANONICAL_BRIDGE_STATE_PATH"
 PLUGIN_STATE_DIRECTORY = "telegram-canonical-bridge"
 
 
@@ -50,6 +51,32 @@ def _hermes_home() -> Path:
         if configured:
             return Path(configured)
         return Path.home() / ".hermes"
+
+
+def shared_state_path() -> Path:
+    """回傳 Controller 與本機各 profile 都能開啟的共用 ledger 路徑。
+
+    Hermes 的 named profile 有自己的 ``HERMES_HOME``；若直接使用它，Controller
+    與 OT 會各寫一份 SQLite。新版 Hermes 提供 machine-root helper，舊版則以
+    Bot Mode 的既有 helper／profile 目錄形狀保守回退。
+    """
+
+    configured = os.getenv(STATE_PATH_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = Path(get_default_hermes_root())
+    except Exception:
+        home = _hermes_home()
+        try:
+            from tools.bot_mode_probe import _hermes_root
+
+            root = Path(_hermes_root(home))
+        except Exception:
+            root = home.parent.parent if home.parent.name == "profiles" else home
+    return root / "plugin-data" / PLUGIN_STATE_DIRECTORY / "bridge.sqlite3"
 
 
 def _string_list(value: Any, *, field: str) -> tuple[str, ...]:
@@ -128,11 +155,11 @@ class BridgeConfig:
         if home_chat_id and not home_chat_id.lstrip("-").isdigit():
             raise BridgeConfigurationError("home_chat_id 必須是數字 Telegram chat ID。")
 
-        configured_state_path = extra.get("state_path")
+        configured_state_path = extra.get("state_path") or os.getenv(STATE_PATH_ENV, "").strip()
         if configured_state_path:
             state_path = Path(str(configured_state_path)).expanduser()
         else:
-            state_path = _hermes_home() / "plugin-data" / PLUGIN_STATE_DIRECTORY / "bridge.sqlite3"
+            state_path = shared_state_path()
 
         poll_timeout = int(_positive_number(
             extra, "telegram_poll_timeout_seconds", 40, minimum=1, maximum=50

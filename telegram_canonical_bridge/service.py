@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -89,7 +90,7 @@ class CanonicalBridgeService:
             self.state.enqueue_notice(
                 chat_id=chat_id,
                 dedup_key=f"route-conflict:{update_id}",
-                content="此 Controller 目前已綁定另一個 Telegram 私訊；V1 不支援多使用者共用同一個 Bot Chat。",
+                content="此 Controller 目前已綁定另一個 Telegram 私訊；目前不支援多使用者共用同一個 Bot Chat。",
             )
             return False
         await self.retry_due_inbound(limit=1)
@@ -100,6 +101,7 @@ class CanonicalBridgeService:
 
         await self.retry_due_inbound()
         await self.sync_history()
+        await self.sync_task_telemetry()
 
     async def retry_due_inbound(self, *, limit: int = 8) -> int:
         submitted = 0
@@ -151,8 +153,15 @@ class CanonicalBridgeService:
 
         async with self._operation_lock:
             async with self._new_rpc() as rpc:
-                handle = await self._open_canonical(rpc)
-                messages = await self._history(rpc, handle.runtime_id)
+                handle = self._known_canonical()
+                if handle is None:
+                    handle = await self._open_canonical(rpc)
+                try:
+                    messages = await self._history(rpc, handle.runtime_id)
+                except RpcError:
+                    # Runtime binding 可能在 backend 重啟後失效；只有這時才 cold resume。
+                    handle = await self._open_canonical(rpc)
+                    messages = await self._history(rpc, handle.runtime_id)
                 assistant_messages = extract_assistant_history(messages)
                 route = self.state.active_route(self.config.controller_profile)
                 bootstrap_key = self._bootstrap_meta_key(handle.root_id)
@@ -167,6 +176,128 @@ class CanonicalBridgeService:
                     self.state.set_meta(bootstrap_key, "ready")
                 self._last_backend_error = ""
                 return queued
+
+    async def sync_task_telemetry(self) -> int:
+        """唯讀補抓 message_agent ack 與背景程序狀態，不呼叫 session.resume。"""
+
+        handle = self._known_canonical()
+        if handle is None:
+            return 0
+        changed = 0
+        async with self._operation_lock:
+            async with self._new_rpc() as rpc:
+                changed += await self._sync_event_replay(rpc, handle)
+                changed += await self._sync_processes(rpc, handle)
+        return changed
+
+    async def _sync_event_replay(self, rpc: HermesRpcClient, handle: CanonicalHandle) -> int:
+        epoch_key = f"event-replay-epoch:{handle.root_id}"
+        cursor_key = f"event-replay-cursor:{handle.root_id}"
+        old_epoch = self.state.get_meta(epoch_key) or ""
+        raw_cursor = self.state.get_meta(cursor_key) or "0"
+        last_seen = int(raw_cursor) if raw_cursor.isdigit() else 0
+
+        response = await rpc.call(
+            "session.events.since",
+            {"session_id": handle.runtime_id, "last_seen": last_seen},
+        )
+        if not isinstance(response, dict):
+            return 0
+        new_epoch = str(response.get("epoch") or "")
+        if old_epoch and new_epoch and old_epoch != new_epoch:
+            response = await rpc.call(
+                "session.events.since",
+                {"session_id": handle.runtime_id, "last_seen": 0},
+            )
+            if not isinstance(response, dict):
+                return 0
+            new_epoch = str(response.get("epoch") or "")
+
+        changed = 0
+        events = response.get("events")
+        for frame in events if isinstance(events, list) else []:
+            if not isinstance(frame, dict):
+                continue
+            # Hermes replay 回傳 bare event params；較舊／第三方 backend 可能保留
+            # JSON-RPC envelope，兩種形狀都接受。
+            nested = frame.get("params")
+            params = nested if isinstance(nested, dict) else frame
+            if params.get("type") != "tool.complete":
+                continue
+            payload = params.get("payload")
+            if not isinstance(payload, dict) or payload.get("name") != "message_agent":
+                continue
+            tool_call_id = str(payload.get("tool_id") or payload.get("tool_call_id") or "")
+            task = self.state.find_task_by_origin_call(handle.runtime_id, tool_call_id)
+            if task is None or task.terminal:
+                continue
+            result = payload.get("result")
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except (TypeError, ValueError):
+                    result = {}
+            result = result if isinstance(result, dict) else {}
+            process_id = str(result.get("process_id") or "").strip()
+            if result.get("status") == "sent" and process_id:
+                self.state.acknowledge_dispatch(
+                    session_id=handle.runtime_id,
+                    tool_call_id=tool_call_id,
+                    process_id=process_id,
+                )
+                changed += 1
+            elif result.get("error"):
+                self.state.fail_dispatch(
+                    session_id=handle.runtime_id,
+                    tool_call_id=tool_call_id,
+                    error=str(result["error"]),
+                )
+                changed += 1
+
+        latest_seq = response.get("latest_seq")
+        if isinstance(latest_seq, int) and latest_seq >= 0:
+            self.state.set_meta(cursor_key, str(latest_seq))
+        if new_epoch:
+            self.state.set_meta(epoch_key, new_epoch)
+        if response.get("truncated"):
+            self.state.set_meta(f"event-replay-truncated:{handle.root_id}", str(latest_seq or 0))
+        return changed
+
+    async def _sync_processes(self, rpc: HermesRpcClient, handle: CanonicalHandle) -> int:
+        tasks = self.state.tasks_requiring_process_poll()
+        by_origin: dict[str, list[Any]] = {}
+        for task in tasks:
+            origin_session_id = task.origin_session_id or handle.runtime_id
+            by_origin.setdefault(origin_session_id, []).append(task)
+
+        changed = 0
+        for origin_session_id, origin_tasks in by_origin.items():
+            response = await rpc.call("process.list", {"session_id": origin_session_id})
+            rows = response.get("processes") if isinstance(response, dict) else None
+            processes = {
+                str(row.get("session_id") or ""): row
+                for row in rows if isinstance(row, dict) and row.get("session_id")
+            } if isinstance(rows, list) else {}
+            for task in origin_tasks:
+                if not task.process_id:
+                    continue
+                row = processes.get(task.process_id)
+                if row is None:
+                    continue
+                raw_exit = row.get("exit_code")
+                try:
+                    exit_code = int(raw_exit) if raw_exit is not None else None
+                except (TypeError, ValueError):
+                    exit_code = None
+                before = (task.status, task.progress, task.exit_code)
+                updated = self.state.observe_process(
+                    task.id,
+                    process_status=str(row.get("status") or ""),
+                    exit_code=exit_code,
+                )
+                if updated and (updated.status, updated.progress, updated.exit_code) != before:
+                    changed += 1
+        return changed
 
     async def _submit_record(self, record: InboundRecord) -> None:
         async with self._new_rpc() as rpc:
@@ -188,6 +319,12 @@ class CanonicalBridgeService:
             self.config.backend_token,
             self.config.rpc_timeout_seconds,
         )
+
+    def _known_canonical(self) -> CanonicalHandle | None:
+        binding = self.state.canonical_binding(self.config.controller_profile)
+        if binding is None:
+            return None
+        return CanonicalHandle(root_id=binding[0], runtime_id=binding[1])
 
     async def _open_canonical(self, rpc: HermesRpcClient) -> CanonicalHandle:
         response = await rpc.call("profiles.list", {"include_sessions": True})

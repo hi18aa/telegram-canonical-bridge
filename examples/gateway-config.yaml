@@ -1,27 +1,49 @@
-# 將此段合併至 <HERMES_HOME>/config.yaml。
-# token 一律放在 <HERMES_HOME>/.env，不要放入 config.yaml。
+# 合併到 Controller 的 <HERMES_HOME>/config.yaml。
+# 秘密一律放在 <HERMES_HOME>/.env，不要寫進這個檔案。
+
 plugins:
   enabled:
     - telegram-canonical-bridge
+  entries:
+    telegram-canonical-bridge:
+      allow_tool_override: false
 
-gateway:
-  platforms:
-    telegram_canonical_bridge:
-      enabled: true
-      extra:
-        # Hermes serve 的 WebSocket endpoint。
-        backend_url: ws://127.0.0.1:9119/api/ws
-        # 這個 profile 必須已有未隱藏、未封存且標題精確為 Bot Chat 的 canonical session。
-        controller_profile: default
-        # 預設拒絕所有人；僅列出可操作此 Controller 的 Telegram user ID。
-        allowed_user_ids:
-          - "123456789"
-        # 選填：再收斂為一個私訊 chat。通常私訊 chat ID 與 user ID 相同。
-        # home_chat_id: "123456789"
-        # 選填：省略時使用 <HERMES_HOME>/plugin-data/telegram-canonical-bridge/bridge.sqlite3。
-        # state_path: C:\\secure-data\\telegram-canonical-bridge.sqlite3
-        telegram_poll_timeout_seconds: 40
-        history_poll_interval_seconds: 3
-        rpc_timeout_seconds: 25
-        retry_base_seconds: 2
-        retry_max_seconds: 60
+# 也可用以下命令加入，不必手動編輯：
+# hermes tools enable telegram_canonical_bridge --platform cli
+platform_toolsets:
+  cli:
+    - hermes-cli
+    - telegram_canonical_bridge
+
+# platforms 位於 config 根層，不是 gateway.platforms。
+platforms:
+  telegram_canonical_bridge:
+    enabled: true
+    extra:
+      # 本機 hermes serve 的 WebSocket endpoint；URL 不可包含 token。
+      backend_url: ws://127.0.0.1:9119/api/ws
+
+      # 必須已有未隱藏、未封存的 canonical Bot Chat。
+      controller_profile: default
+
+      # 必填且預設拒絕所有人；只列出可信任的 Telegram numeric user ID。
+      allowed_user_ids:
+        - '123456789'
+
+      # 選填：再鎖定一個 private chat；通常 private chat ID 與 user ID 相同。
+      home_chat_id: '123456789'
+
+      # 預設會用 machine-root 共用 ledger。若自訂，Controller 與所有 OT
+      # profile 都必須以 TELEGRAM_CANONICAL_BRIDGE_STATE_PATH 指向同一路徑。
+      # state_path: C:\secure-data\telegram-canonical-bridge.sqlite3
+
+      telegram_poll_timeout_seconds: 40
+      history_poll_interval_seconds: 3
+      rpc_timeout_seconds: 25
+      retry_base_seconds: 2
+      retry_max_seconds: 60
+
+# 每個 OT profile 只需安裝／啟用 plugin 與 cli toolset，不要啟用 platform，
+# 也不需要 Telegram 或 backend secrets：
+# hermes -p operitrace-agent plugins install hi18aa/telegram-canonical-bridge --enable
+# hermes -p operitrace-agent tools enable telegram_canonical_bridge --platform cli

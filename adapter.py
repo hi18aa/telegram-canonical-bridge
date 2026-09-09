@@ -26,6 +26,11 @@ from .telegram_canonical_bridge.config import (
 from .telegram_canonical_bridge.protocol import split_telegram_text, telegram_text_units
 from .telegram_canonical_bridge.service import CanonicalBridgeService
 from .telegram_canonical_bridge.state import BridgeState
+from .telegram_canonical_bridge.task_model import (
+    normalize_task_id,
+    render_task_card,
+    render_task_list,
+)
 from .telegram_canonical_bridge.telegram_api import TelegramApiError, TelegramBotApi
 
 
@@ -212,15 +217,18 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 content="目前僅支援 Telegram 純文字訊息。",
             )
             return
-        command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+        stripped = text.strip()
+        command_token, _separator, command_args = stripped.partition(" ")
+        command = command_token.split("@", 1)[0].lower()
         if command in {"/start", "/help"}:
             self._state.enqueue_notice(
                 chat_id=chat_id,
                 dedup_key=f"help:{update_id}",
                 content=(
                     "此 Bot 會將你的文字送到 Hermes Controller 的 canonical Bot Chat。\n"
-                    "可用指令：/status、/help\n"
-                    "一般文字會保留 Bot Mode，因此 Controller 可原生使用 message_agent。"
+                    "可用指令：/status、/tasks、/task <ID>、/tell <ID> <留言>、/help\n"
+                    "也可直接回覆任務卡來留言。一般文字會保留 Bot Mode，"
+                    "因此 Controller 可原生使用 message_agent。"
                 ),
             )
             return
@@ -238,6 +246,55 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 ),
             )
             return
+        if command == "/tasks":
+            self._state.enqueue_notice(
+                chat_id=chat_id,
+                dedup_key=f"tasks:{update_id}",
+                content=render_task_list(self._state.list_tasks(chat_id=chat_id, limit=10)),
+            )
+            return
+        if command == "/task":
+            task_id = normalize_task_id(command_args)
+            task = self._state.task(task_id) if task_id else None
+            content = (
+                render_task_card(task)
+                if task is not None and task.chat_id == chat_id
+                else "找不到任務。用法：/task TCB-YYYYMMDD-XXXXXX"
+            )
+            self._state.enqueue_notice(
+                chat_id=chat_id,
+                dedup_key=f"task:{update_id}",
+                content=content,
+            )
+            return
+        if command == "/tell":
+            task_token, separator, note = command_args.strip().partition(" ")
+            await self._record_task_note(
+                update_id=update_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                task_id=task_token if separator else "",
+                text=note if separator else "",
+            )
+            return
+
+        replied = message.get("reply_to_message")
+        if isinstance(replied, dict) and replied.get("message_id") is not None:
+            task = self._state.task_by_telegram_message(
+                chat_id=chat_id,
+                telegram_message_id=str(replied["message_id"]),
+            )
+            if task is not None:
+                await self._record_task_note(
+                    update_id=update_id,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                    task_id=task.id,
+                    text=text,
+                )
+                return
 
         await self.send_typing(chat_id)
         await self._service.receive_text(
@@ -246,6 +303,29 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
             user_id=user_id,
             message_id=message_id,
             text=text,
+        )
+
+    async def _record_task_note(
+        self,
+        *,
+        update_id: int,
+        chat_id: str,
+        user_id: str,
+        message_id: str,
+        task_id: str,
+        text: str,
+    ) -> None:
+        _task, accepted, detail = self._state.add_task_note(
+            task_id=task_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            telegram_message_id=message_id,
+            text=text,
+        )
+        self._state.enqueue_notice(
+            chat_id=chat_id,
+            dedup_key=f"task-note-result:{update_id}",
+            content=("✅ " if accepted else "⚠️ ") + detail,
         )
 
     async def _bridge_tick_loop(self) -> None:
@@ -267,7 +347,39 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 continue
             for record in records:
                 try:
-                    message_id = await self._telegram.send_message(chat_id=record.chat_id, text=record.content)
+                    task_message_id = (
+                        self._state.task_telegram_message_id(record.task_id)
+                        if record.kind == "task_status" and record.task_id
+                        else None
+                    )
+                    if task_message_id:
+                        try:
+                            message_id = await self._telegram.edit_message_text(
+                                chat_id=record.chat_id,
+                                message_id=task_message_id,
+                                text=record.content,
+                            )
+                        except TelegramApiError as exc:
+                            detail = exc.message.lower()
+                            recoverable_card = exc.error_code == 400 and any(
+                                phrase in detail for phrase in (
+                                    "message to edit not found",
+                                    "message can't be edited",
+                                    "message can not be edited",
+                                )
+                            )
+                            if not recoverable_card or not record.task_id:
+                                raise
+                            self._state.clear_task_telegram_message(
+                                record.task_id, expected_message_id=task_message_id
+                            )
+                            message_id = await self._telegram.send_message(
+                                chat_id=record.chat_id, text=record.content
+                            )
+                    else:
+                        message_id = await self._telegram.send_message(
+                            chat_id=record.chat_id, text=record.content
+                        )
                 except asyncio.CancelledError:
                     raise
                 except TelegramApiError as exc:

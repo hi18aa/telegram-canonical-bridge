@@ -48,6 +48,23 @@ class TelegramBotApi:
             raise TelegramApiError("Telegram sendMessage 沒有回傳 message_id。")
         return str(result["message_id"])
 
+    async def edit_message_text(self, *, chat_id: str, message_id: str, text: str) -> str:
+        try:
+            result = await self._call(
+                "editMessageText",
+                {"chat_id": chat_id, "message_id": int(message_id), "text": text},
+                timeout_seconds=25,
+            )
+        except TelegramApiError as exc:
+            if exc.error_code == 400 and "message is not modified" in exc.message.lower():
+                return str(message_id)
+            raise
+        if isinstance(result, dict) and result.get("message_id") is not None:
+            return str(result["message_id"])
+        if result is True:
+            return str(message_id)
+        raise TelegramApiError("Telegram editMessageText 沒有回傳 Message。")
+
     async def send_typing(self, *, chat_id: str) -> None:
         await self._call("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout_seconds=15)
 
@@ -60,7 +77,7 @@ class TelegramBotApi:
         request = Request(
             endpoint,
             data=body,
-            headers={"Content-Type": "application/json", "User-Agent": "telegram-canonical-bridge/0.1"},
+            headers={"Content-Type": "application/json", "User-Agent": "telegram-canonical-bridge/0.2"},
             method="POST",
         )
         try:
