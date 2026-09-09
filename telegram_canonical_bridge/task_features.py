@@ -1,6 +1,6 @@
 """Hermes hooks 與 OT 可呼叫的任務狀態工具。
 
-V2 不覆寫 message_agent。它只在原生呼叫前加入 opaque task marker，並以
+V3 不覆寫 message_agent。它只在原生呼叫前加入 opaque task marker，並以
 Hermes 公開 hook／tool API 把可驗證的狀態寫入共用 SQLite ledger。
 """
 
@@ -234,7 +234,7 @@ def _before_llm(
                 "可公開的最終里程碑，"
                 "再照常回覆 Controller；bridge 會由 post_llm_call 與背景程序狀態判定完成，"
                 "不需自行宣稱 completed。若漏掉明確里程碑，bridge 只會把清理後的最終答覆"
-                "摘要留在 Telegram 任務卡，不會保存內部思考或原始工具資料。"
+                "摘要留在 Telegram 任務時間線，不會保存內部思考或原始工具資料。"
             )
         }
     except Exception:
@@ -336,7 +336,7 @@ def bridge_task_update(args: dict[str, Any], **kwargs: Any) -> str:
         "ok": updated is not None,
         "task_id": task.id,
         "status": updated.status if updated else task.status,
-        "message": "Telegram 任務卡已排入更新。",
+        "message": "Telegram 任務進度已排入時間線。",
     })
 
 

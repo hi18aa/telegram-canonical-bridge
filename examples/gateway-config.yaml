@@ -39,6 +39,14 @@ platforms:
 
       telegram_poll_timeout_seconds: 40
       history_poll_interval_seconds: 3
+
+      # 預設 timeline：重要任務事件各自成為新訊息。
+      # 改成 compact 可沿用 V2 的單一可編輯狀態卡。
+      task_presentation: timeline
+
+      # sendChatAction(typing) 的續期間隔；Telegram 狀態最多維持數秒。
+      typing_interval_seconds: 4
+
       rpc_timeout_seconds: 25
       retry_base_seconds: 2
       retry_max_seconds: 60

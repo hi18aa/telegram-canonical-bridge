@@ -21,9 +21,13 @@ from .task_model import (
     TaskRecord,
     new_task_id,
     normalize_task_id,
-    render_task_card,
+    render_task_event,
     sanitize_progress,
 )
+
+
+AUTOMATIC_TASK_EVENT_MIN_INTERVAL_SECONDS = 15.0
+ACTIVE_TYPING_TASK_STATUSES = ("dispatching", "dispatched", "running", "returning")
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,8 @@ class OutboxRecord:
     attempts: int
     kind: str = "notice"
     task_id: str | None = None
+    reply_to_message_id: str | None = None
+    silent: bool = False
 
 
 class BridgeState:
@@ -86,7 +92,9 @@ class BridgeState:
                     last_error TEXT,
                     failure_notified INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
-                    submitted_at REAL
+                    submitted_at REAL,
+                    responded_at REAL,
+                    response_pending INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS inbound_chat_message
                     ON inbound(chat_id, message_id);
@@ -123,6 +131,8 @@ class BridgeState:
                     lease_until REAL,
                     last_error TEXT,
                     telegram_message_id TEXT,
+                    reply_to_message_id TEXT,
+                    silent INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL,
                     sent_at REAL
                 );
@@ -191,6 +201,12 @@ class BridgeState:
                 """
             )
             self._ensure_column(connection, "outbox", "task_id", "TEXT")
+            self._ensure_column(connection, "outbox", "reply_to_message_id", "TEXT")
+            self._ensure_column(connection, "outbox", "silent", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "inbound", "responded_at", "REAL")
+            self._ensure_column(
+                connection, "inbound", "response_pending", "INTEGER NOT NULL DEFAULT 0"
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbox_task_status "
                 "ON outbox(task_id, kind, status)"
@@ -276,9 +292,10 @@ class BridgeState:
         with self._transaction() as connection:
             rows = connection.execute(
                 "SELECT id, update_id, chat_id, user_id, message_id, text, attempts FROM inbound "
-                "WHERE status IN ('received', 'retry') AND next_attempt_at <= ? "
-                "AND (lease_until IS NULL OR lease_until < ?) ORDER BY id LIMIT ?",
-                (now, now, limit),
+                "WHERE ((status IN ('received', 'retry') AND next_attempt_at <= ? "
+                "AND (lease_until IS NULL OR lease_until < ?)) "
+                "OR (status = 'processing' AND lease_until < ?)) ORDER BY id LIMIT ?",
+                (now, now, now, limit),
             ).fetchall()
             for row in rows:
                 connection.execute(
@@ -295,7 +312,8 @@ class BridgeState:
     def mark_inbound_submitted(self, record_id: int) -> None:
         with self._transaction() as connection:
             connection.execute(
-                "UPDATE inbound SET status = 'submitted', submitted_at = ?, lease_until = NULL, last_error = NULL "
+                "UPDATE inbound SET status = 'submitted', submitted_at = ?, response_pending = 1, "
+                "responded_at = NULL, lease_until = NULL, last_error = NULL "
                 "WHERE id = ?",
                 (time.time(), record_id),
             )
@@ -305,7 +323,8 @@ class BridgeState:
 
         with self._transaction() as connection:
             connection.execute(
-                "UPDATE inbound SET status = 'uncertain', lease_until = NULL, last_error = ? WHERE id = ?",
+                "UPDATE inbound SET status = 'uncertain', response_pending = 0, "
+                "lease_until = NULL, last_error = ? WHERE id = ?",
                 (error[:1000], record_id),
             )
 
@@ -321,10 +340,36 @@ class BridgeState:
             notify = not bool(row["failure_notified"])
             connection.execute(
                 "UPDATE inbound SET status = 'retry', attempts = ?, next_attempt_at = ?, lease_until = NULL, "
-                "last_error = ?, failure_notified = CASE WHEN ? THEN 1 ELSE failure_notified END WHERE id = ?",
+                "response_pending = 0, last_error = ?, "
+                "failure_notified = CASE WHEN ? THEN 1 ELSE failure_notified END WHERE id = ?",
                 (attempts, now + delay_seconds, error[:1000], int(notify), record_id),
             )
         return attempts, notify
+
+    def active_chat_ids(self, *, max_inbound_age_seconds: float = 21_600) -> list[str]:
+        """回傳目前有證據正在處理的 chat，供 Telegram typing heartbeat 使用。"""
+
+        cutoff = time.time() - max(60.0, float(max_inbound_age_seconds))
+        now = time.time()
+        placeholders = ",".join("?" for _ in ACTIVE_TYPING_TASK_STATUSES)
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT chat_id FROM inbound WHERE "
+                "((status = 'processing' AND lease_until >= ?) OR "
+                "(status = 'submitted' AND response_pending = 1 "
+                "AND submitted_at >= ?)) "
+                "UNION SELECT chat_id FROM bridge_tasks "
+                f"WHERE status IN ({placeholders}) ORDER BY chat_id",
+                (now, cutoff, *ACTIVE_TYPING_TASK_STATUSES),
+            ).fetchall()
+        return [str(row["chat_id"]) for row in rows]
+
+    def chat_has_active_work(
+        self, chat_id: str, *, max_inbound_age_seconds: float = 21_600
+    ) -> bool:
+        return str(chat_id) in set(
+            self.active_chat_ids(max_inbound_age_seconds=max_inbound_age_seconds)
+        )
 
     def bind_active_route(self, *, controller_profile: str, chat_id: str, user_id: str) -> bool:
         """目前僅允許一個 Telegram 私訊綁定同一 Controller。"""
@@ -525,7 +570,7 @@ class BridgeState:
             task = self._task_locked(connection, task_id)
             assert task is not None
             self._record_task_event_locked(connection, task)
-            self._queue_task_card_locked(connection, task)
+            self._queue_task_event_locked(connection, task)
             return task, True
 
     @staticmethod
@@ -537,27 +582,38 @@ class BridgeState:
         )
 
     @staticmethod
-    def _queue_task_card_locked(connection: sqlite3.Connection, task: TaskRecord) -> None:
-        """合併尚未送出的 revision，避免每個工具事件都新增 Telegram 訊息。"""
+    def _queue_task_event_locked(connection: sqlite3.Connection, task: TaskRecord) -> None:
+        """建立不可變時間線事件；高頻自動工具活動會節流，明確里程碑不合併。"""
 
-        content = render_task_card(task)
-        dedup_key = f"task-card:{task.id}:revision:{task.revision}"
-        queued = connection.execute(
-            "SELECT id FROM outbox WHERE task_id = ? AND kind = 'task_status' "
-            "AND status IN ('pending', 'retry') ORDER BY id DESC LIMIT 1",
+        recent_events = connection.execute(
+            "SELECT status, evidence FROM bridge_task_events WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 2",
             (task.id,),
-        ).fetchone()
-        if queued is not None:
-            connection.execute(
-                "UPDATE outbox SET dedup_key = ?, content = ?, status = 'pending', "
-                "next_attempt_at = 0, lease_until = NULL, last_error = NULL WHERE id = ?",
-                (dedup_key, content, int(queued["id"])),
-            )
-            return
+        ).fetchall()
+        previous_status = str(recent_events[1]["status"]) if len(recent_events) > 1 else ""
+        status_changed = not previous_status or previous_status != task.status
+        explicit = task.evidence in {
+            "OT explicit bridge_task_update",
+            "OT explicit bridge_task_result",
+        }
+        now = time.time()
+        if not status_changed and not explicit:
+            latest = connection.execute(
+                "SELECT created_at FROM outbox WHERE task_id = ? AND kind = 'task_status' "
+                "ORDER BY id DESC LIMIT 1",
+                (task.id,),
+            ).fetchone()
+            if latest is not None and now - float(latest["created_at"]) < AUTOMATIC_TASK_EVENT_MIN_INTERVAL_SECONDS:
+                return
+
+        content = render_task_event(task)
+        dedup_key = f"task-event:{task.id}:revision:{task.revision}"
+        silent = int(task.status not in {"blocked", "failed", "cancelled", "finished", "completed"})
         connection.execute(
-            "INSERT OR IGNORE INTO outbox(chat_id, dedup_key, content, kind, task_id, status, created_at) "
-            "VALUES (?, ?, ?, 'task_status', ?, 'pending', ?)",
-            (task.chat_id, dedup_key, content, task.id, time.time()),
+            "INSERT OR IGNORE INTO outbox("
+            "chat_id, dedup_key, content, kind, task_id, status, silent, created_at) "
+            "VALUES (?, ?, ?, 'task_status', ?, 'pending', ?, ?)",
+            (task.chat_id, dedup_key, content, task.id, silent, now),
         )
 
     @staticmethod
@@ -630,7 +686,7 @@ class BridgeState:
                 updated = self._task_locked(connection, task.id)
                 assert updated is not None
                 self._record_task_event_locked(connection, updated)
-                self._queue_task_card_locked(connection, updated)
+                self._queue_task_event_locked(connection, updated)
                 self._queue_missed_notes_notice_locked(connection, updated, missed)
                 reconciled += missed
         return reconciled
@@ -711,7 +767,7 @@ class BridgeState:
             updated = self._task_locked(connection, normalized)
             assert updated is not None
             self._record_task_event_locked(connection, updated)
-            self._queue_task_card_locked(connection, updated)
+            self._queue_task_event_locked(connection, updated)
             self._queue_missed_notes_notice_locked(connection, updated, missed_notes)
             return updated
 
@@ -908,8 +964,10 @@ class BridgeState:
         with self._read_connection() as connection:
             row = connection.execute(
                 self._task_select()
-                + "WHERE t.chat_id = ? AND t.telegram_message_id = ? ORDER BY t.created_at DESC LIMIT 1",
-                (chat_id, telegram_message_id),
+                + "WHERE t.chat_id = ? AND (t.telegram_message_id = ? OR EXISTS ("
+                "SELECT 1 FROM outbox o WHERE o.task_id = t.task_id AND o.chat_id = ? "
+                "AND o.telegram_message_id = ?)) ORDER BY t.created_at DESC LIMIT 1",
+                (chat_id, telegram_message_id, chat_id, telegram_message_id),
             ).fetchone()
         return self._task_from_row(row) if row else None
 
@@ -955,7 +1013,7 @@ class BridgeState:
             updated = self._task_locked(connection, normalized)
             assert updated is not None
             self._record_task_event_locked(connection, updated)
-            self._queue_task_card_locked(connection, updated)
+            self._queue_task_event_locked(connection, updated)
             return updated, True, "留言已保存；OT 會在下一個 task inbox 檢查點讀取。"
 
     def read_task_notes(
@@ -996,7 +1054,7 @@ class BridgeState:
                 task = self._task_locked(connection, normalized)
                 assert task is not None
                 self._record_task_event_locked(connection, task)
-                self._queue_task_card_locked(connection, task)
+                self._queue_task_event_locked(connection, task)
             return task, notes
 
     def set_canonical_binding(self, *, controller_profile: str, root_id: str, runtime_id: str) -> None:
@@ -1036,22 +1094,60 @@ class BridgeState:
                 ).rowcount
                 if not inserted or bootstrap or not chat_id:
                     continue
+                reply_to_message_id = self._complete_oldest_inbound_locked(
+                    connection, chat_id=chat_id, now=now
+                )
                 for part_index, chunk in enumerate(split_telegram_text(message.text), start=1):
                     dedup_key = f"canonical:{root_id}:{message.key}:part:{part_index}"
                     outbox_inserted = connection.execute(
-                        "INSERT OR IGNORE INTO outbox(chat_id, dedup_key, content, kind, status, created_at) "
-                        "VALUES (?, ?, ?, 'assistant', 'pending', ?)",
-                        (chat_id, dedup_key, chunk, now),
+                        "INSERT OR IGNORE INTO outbox("
+                        "chat_id, dedup_key, content, kind, status, reply_to_message_id, created_at) "
+                        "VALUES (?, ?, ?, 'assistant', 'pending', ?, ?)",
+                        (
+                            chat_id, dedup_key, chunk,
+                            reply_to_message_id if part_index == 1 else None,
+                            now,
+                        ),
                     ).rowcount
                     queued += int(bool(outbox_inserted))
         return queued
 
-    def enqueue_notice(self, *, chat_id: str, dedup_key: str, content: str) -> bool:
+    @staticmethod
+    def _complete_oldest_inbound_locked(
+        connection: sqlite3.Connection, *, chat_id: str, now: float
+    ) -> str | None:
+        row = connection.execute(
+            "SELECT id, message_id FROM inbound WHERE chat_id = ? AND status = 'submitted' "
+            "AND response_pending = 1 ORDER BY id LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            "UPDATE inbound SET status = 'responded', response_pending = 0, responded_at = ? "
+            "WHERE id = ?",
+            (now, int(row["id"])),
+        )
+        return str(row["message_id"])
+
+    def enqueue_notice(
+        self,
+        *,
+        chat_id: str,
+        dedup_key: str,
+        content: str,
+        reply_to_message_id: str | None = None,
+        silent: bool = False,
+    ) -> bool:
         with self._transaction() as connection:
             inserted = connection.execute(
-                "INSERT OR IGNORE INTO outbox(chat_id, dedup_key, content, kind, status, created_at) "
-                "VALUES (?, ?, ?, 'notice', 'pending', ?)",
-                (chat_id, dedup_key, content, time.time()),
+                "INSERT OR IGNORE INTO outbox("
+                "chat_id, dedup_key, content, kind, status, reply_to_message_id, silent, created_at) "
+                "VALUES (?, ?, ?, 'notice', 'pending', ?, ?, ?)",
+                (
+                    chat_id, dedup_key, content, reply_to_message_id,
+                    int(bool(silent)), time.time(),
+                ),
             ).rowcount
         return bool(inserted)
 
@@ -1060,9 +1156,14 @@ class BridgeState:
         claimed: list[OutboxRecord] = []
         with self._transaction() as connection:
             rows = connection.execute(
-                "SELECT id, chat_id, content, attempts, kind, task_id FROM outbox "
-                "WHERE ((status IN ('pending', 'retry') AND next_attempt_at <= ?) "
-                "OR (status = 'sending' AND lease_until < ?)) ORDER BY id LIMIT ?",
+                "SELECT o.id, o.chat_id, o.content, o.attempts, o.kind, o.task_id, "
+                "o.reply_to_message_id, o.silent FROM outbox o "
+                "WHERE ((o.status IN ('pending', 'retry') AND o.next_attempt_at <= ?) "
+                "OR (o.status = 'sending' AND o.lease_until < ?)) "
+                "AND (o.task_id IS NULL OR NOT EXISTS ("
+                "SELECT 1 FROM outbox prior WHERE prior.task_id = o.task_id "
+                "AND prior.id < o.id AND prior.status <> 'sent')) "
+                "ORDER BY o.id LIMIT ?",
                 (now, now, limit),
             ).fetchall()
             for row in rows:
@@ -1074,6 +1175,10 @@ class BridgeState:
                     id=int(row["id"]), chat_id=str(row["chat_id"]), content=str(row["content"]),
                     attempts=int(row["attempts"]), kind=str(row["kind"]),
                     task_id=str(row["task_id"]) if row["task_id"] else None,
+                    reply_to_message_id=(
+                        str(row["reply_to_message_id"]) if row["reply_to_message_id"] else None
+                    ),
+                    silent=bool(row["silent"]),
                 ))
         return claimed
 
@@ -1099,7 +1204,7 @@ class BridgeState:
         return task.telegram_message_id if task else None
 
     def clear_task_telegram_message(self, task_id: str, *, expected_message_id: str) -> bool:
-        """狀態卡被刪除或不可編輯時，解除舊 ID 以便安全建立新卡。"""
+        """時間線錨點被刪除或 compact 卡不可編輯時，解除舊 ID 以便重建。"""
 
         normalized = normalize_task_id(task_id)
         if not normalized or not expected_message_id:

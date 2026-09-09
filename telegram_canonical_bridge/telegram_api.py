@@ -39,8 +39,19 @@ class TelegramBotApi:
         result = await self._call("getUpdates", payload, timeout_seconds=timeout_seconds + 15)
         return [item for item in result if isinstance(item, dict)] if isinstance(result, list) else []
 
-    async def send_message(self, *, chat_id: str, text: str, reply_to_message_id: str | None = None) -> str:
-        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    async def send_message(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        reply_to_message_id: str | None = None,
+        disable_notification: bool = False,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_notification": bool(disable_notification),
+        }
         if reply_to_message_id:
             payload["reply_parameters"] = {"message_id": int(reply_to_message_id)}
         result = await self._call("sendMessage", payload, timeout_seconds=25)
@@ -77,7 +88,7 @@ class TelegramBotApi:
         request = Request(
             endpoint,
             data=body,
-            headers={"Content-Type": "application/json", "User-Agent": "telegram-canonical-bridge/0.2"},
+            headers={"Content-Type": "application/json", "User-Agent": "telegram-canonical-bridge/0.3"},
             method="POST",
         )
         try:

@@ -121,6 +121,8 @@ class BridgeConfig:
     rpc_timeout_seconds: float
     retry_base_seconds: float
     retry_max_seconds: float
+    task_presentation: str = "timeline"
+    typing_interval_seconds: float = 4.0
 
     @classmethod
     def from_platform_config(cls, platform_config: Any) -> "BridgeConfig":
@@ -170,6 +172,14 @@ class BridgeConfig:
         rpc_timeout = _positive_number(extra, "rpc_timeout_seconds", 25, minimum=3, maximum=180)
         retry_base = _positive_number(extra, "retry_base_seconds", 2, minimum=1, maximum=60)
         retry_max = _positive_number(extra, "retry_max_seconds", 60, minimum=retry_base, maximum=3600)
+        task_presentation = str(extra.get("task_presentation") or "timeline").strip().lower()
+        if task_presentation not in {"timeline", "compact"}:
+            raise BridgeConfigurationError(
+                "task_presentation 必須是 timeline 或 compact。"
+            )
+        typing_interval = _positive_number(
+            extra, "typing_interval_seconds", 4, minimum=2, maximum=5
+        )
 
         return cls(
             bot_token=bot_token,
@@ -184,6 +194,8 @@ class BridgeConfig:
             rpc_timeout_seconds=rpc_timeout,
             retry_base_seconds=retry_base,
             retry_max_seconds=retry_max,
+            task_presentation=task_presentation,
+            typing_interval_seconds=typing_interval,
         )
 
     def is_allowed_user(self, user_id: str | int | None) -> bool:

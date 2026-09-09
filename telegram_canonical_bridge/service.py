@@ -95,6 +95,13 @@ class CanonicalBridgeService:
                 content="此 Controller 目前已綁定另一個 Telegram 私訊；目前不支援多使用者共用同一個 Bot Chat。",
             )
             return False
+        self.state.enqueue_notice(
+            chat_id=chat_id,
+            dedup_key=f"inbound-accepted:{update_id}",
+            content="📥 已收到，正在送往 Hermes Controller。",
+            reply_to_message_id=message_id,
+            silent=True,
+        )
         await self.retry_due_inbound(limit=1)
         return True
 
@@ -108,7 +115,10 @@ class CanonicalBridgeService:
     async def retry_due_inbound(self, *, limit: int = 8) -> int:
         submitted = 0
         async with self._operation_lock:
-            for record in self.state.claim_due_inbound(limit=limit):
+            for record in self.state.claim_due_inbound(
+                limit=limit,
+                lease_seconds=max(60, self.config.rpc_timeout_seconds + 15),
+            ):
                 try:
                     await self._submit_record(record)
                 except Exception as exc:
@@ -417,5 +427,7 @@ class CanonicalBridgeService:
             "canonical_root_id": binding[0] if binding else "",
             "canonical_runtime_id": binding[1] if binding else "",
             "last_backend_error": self._last_backend_error,
+            "task_presentation": self.config.task_presentation,
+            "typing_interval_seconds": self.config.typing_interval_seconds,
             **self.state.counts(),
         }

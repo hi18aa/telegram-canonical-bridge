@@ -1,7 +1,7 @@
 """可追蹤 ``message_agent`` 任務的領域模型與 Telegram 呈現。
 
 這裡只保存可安全顯示的狀態摘要，以及追蹤任務的清理後 OT 最終答覆摘要；
-原始 prompt、conversation history、工具參數與工具結果不會寫入任務卡，
+原始 prompt、conversation history、工具參數與工具結果不會寫入任務時間線，
 避免把 Controller／OT 的私密內容意外轉送到 Telegram。
 """
 
@@ -125,6 +125,33 @@ def render_task_card(task: TaskRecord) -> str:
     lines.append(f"更新：{_local_time(task.updated_at)}")
     if not task.terminal:
         lines.append(f"回覆此訊息可留言，或使用 /tell {task.id} <內容>")
+    return "\n".join(lines)
+
+
+def render_task_event(task: TaskRecord) -> str:
+    """產生適合不可變 Telegram 時間線的簡潔任務事件。"""
+
+    status = TASK_STATUS_LABELS.get(task.status, task.status)
+    emoji = {
+        "dispatching": "🧭",
+        "dispatched": "📨",
+        "running": "🔄",
+        "waiting": "⏳",
+        "blocked": "⚠️",
+        "returning": "📬",
+        "completed": "✅",
+        "finished": "⚠️",
+        "failed": "❌",
+        "cancelled": "⛔",
+    }.get(task.status, "ℹ️")
+    lines = [
+        f"{emoji} 任務 {task.id}｜@{task.target.lstrip('@')}",
+        f"{status}：{task.progress or '尚無進一步證據'}",
+    ]
+    if task.last_error and task.status in {"blocked", "failed"}:
+        lines.append(f"錯誤：{sanitize_progress(task.last_error, limit=280)}")
+    if task.status == "dispatching":
+        lines.append("後續進度會以新訊息發布；回覆任一任務訊息都可留言。")
     return "\n".join(lines)
 
 

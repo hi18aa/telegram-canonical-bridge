@@ -101,13 +101,20 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 self.assertTrue(await service.receive_text(
                     update_id="1", chat_id="10", user_id="20", message_id="30", text="請派子代理"
                 ))
+                self.assertEqual(service.state.active_chat_ids(), ["10"])
                 backend.history.append({
                     "_row_id": "new", "role": "assistant", "content": "已完成並回報。"
                 })
                 self.assertEqual(await service.sync_history(), 1)
 
                 outbox = service.state.claim_due_outbox()
-                self.assertEqual([record.content for record in outbox], ["已完成並回報。"])
+                self.assertEqual(
+                    [record.content for record in outbox],
+                    ["📥 已收到，正在送往 Hermes Controller。", "已完成並回報。"],
+                )
+                self.assertEqual([record.reply_to_message_id for record in outbox], ["30", "30"])
+                self.assertEqual([record.silent for record in outbox], [True, False])
+                self.assertEqual(service.state.active_chat_ids(), [])
                 self.assertEqual(backend.prompts, ["請派子代理"])
                 methods = [method for method, _params in backend.calls]
                 self.assertIn("session.resume", methods)

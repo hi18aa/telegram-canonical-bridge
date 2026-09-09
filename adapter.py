@@ -93,6 +93,7 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
         self._start_task(self._poll_updates_loop(), "telegram-canonical-bridge-poll")
         self._start_task(self._bridge_tick_loop(), "telegram-canonical-bridge-history")
         self._start_task(self._outbox_loop(), "telegram-canonical-bridge-outbox")
+        self._start_task(self._typing_loop(), "telegram-canonical-bridge-typing")
         # Hermes backend 暫時不可達時，輸入仍會先保存在 SQLite，故不阻止 Telegram 啟動。
         await self._service.startup_probe()
         return True
@@ -122,6 +123,7 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                     chat_id=str(chat_id),
                     text=chunk,
                     reply_to_message_id=reply_to if index == 0 else None,
+                    disable_notification=False,
                 ))
         except TelegramApiError as exc:
             return SendResult(
@@ -227,7 +229,7 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 content=(
                     "此 Bot 會將你的文字送到 Hermes Controller 的 canonical Bot Chat。\n"
                     "可用指令：/status、/tasks、/task <ID>、/tell <ID> <留言>、/help\n"
-                    "也可直接回覆任務卡來留言。一般文字會保留 Bot Mode，"
+                    "也可直接回覆任一任務進度訊息來留言。一般文字會保留 Bot Mode，"
                     "因此 Controller 可原生使用 message_agent。"
                 ),
             )
@@ -241,6 +243,8 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 content=(
                     f"Controller：{status['controller_profile']}\n"
                     f"Backend：{backend}\n"
+                    f"呈現：{status['task_presentation']}；"
+                    f"typing 每 {status['typing_interval_seconds']:g} 秒續期\n"
                     f"待送輸入：{status['pending_inbound']}（未確認送達：{status['uncertain_inbound']}）；"
                     f"待送回覆：{status['pending_outbox']}"
                 ),
@@ -339,6 +343,19 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                 logger.warning("[%s] Hermes bridge tick failed: %s", PLATFORM_NAME, exc)
             await asyncio.sleep(self.bridge_config.history_poll_interval_seconds)
 
+    async def _typing_loop(self) -> None:
+        """Telegram typing 最多維持數秒；有活動證據時定期續期。"""
+
+        while self._running:
+            try:
+                for chat_id in self._state.active_chat_ids():
+                    await self.send_typing(chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[%s] Telegram typing heartbeat failed: %s", PLATFORM_NAME, exc)
+            await asyncio.sleep(self.bridge_config.typing_interval_seconds)
+
     async def _outbox_loop(self) -> None:
         while self._running:
             records = self._state.claim_due_outbox()
@@ -352,34 +369,83 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                         if record.kind == "task_status" and record.task_id
                         else None
                     )
-                    if task_message_id:
-                        try:
-                            message_id = await self._telegram.edit_message_text(
+                    compact_task = (
+                        self.bridge_config.task_presentation == "compact"
+                        and record.kind == "task_status"
+                        and bool(record.task_id)
+                    )
+                    if compact_task:
+                        task = self._state.task(record.task_id)
+                        content = render_task_card(task) if task is not None else record.content
+                        if task_message_id:
+                            try:
+                                message_id = await self._telegram.edit_message_text(
+                                    chat_id=record.chat_id,
+                                    message_id=task_message_id,
+                                    text=content,
+                                )
+                            except TelegramApiError as exc:
+                                detail = exc.message.lower()
+                                recoverable_card = exc.error_code == 400 and any(
+                                    phrase in detail for phrase in (
+                                        "message to edit not found",
+                                        "message can't be edited",
+                                        "message can not be edited",
+                                    )
+                                )
+                                if not recoverable_card or not record.task_id:
+                                    raise
+                                self._state.clear_task_telegram_message(
+                                    record.task_id, expected_message_id=task_message_id
+                                )
+                                message_id = await self._telegram.send_message(
+                                    chat_id=record.chat_id,
+                                    text=content,
+                                    disable_notification=record.silent,
+                                )
+                        else:
+                            message_id = await self._telegram.send_message(
                                 chat_id=record.chat_id,
-                                message_id=task_message_id,
+                                text=content,
+                                reply_to_message_id=record.reply_to_message_id,
+                                disable_notification=record.silent,
+                            )
+                    else:
+                        reply_to = record.reply_to_message_id
+                        if (
+                            self.bridge_config.task_presentation == "timeline"
+                            and record.kind == "task_status"
+                            and record.task_id
+                            and task_message_id
+                        ):
+                            reply_to = task_message_id
+                        try:
+                            message_id = await self._telegram.send_message(
+                                chat_id=record.chat_id,
                                 text=record.content,
+                                reply_to_message_id=reply_to,
+                                disable_notification=record.silent,
                             )
                         except TelegramApiError as exc:
                             detail = exc.message.lower()
-                            recoverable_card = exc.error_code == 400 and any(
+                            missing_reply = exc.error_code == 400 and reply_to and any(
                                 phrase in detail for phrase in (
-                                    "message to edit not found",
-                                    "message can't be edited",
-                                    "message can not be edited",
+                                    "message to be replied not found",
+                                    "reply message not found",
+                                    "replied message not found",
                                 )
                             )
-                            if not recoverable_card or not record.task_id:
+                            if not missing_reply:
                                 raise
-                            self._state.clear_task_telegram_message(
-                                record.task_id, expected_message_id=task_message_id
-                            )
+                            if record.task_id and task_message_id == reply_to:
+                                self._state.clear_task_telegram_message(
+                                    record.task_id, expected_message_id=task_message_id
+                                )
                             message_id = await self._telegram.send_message(
-                                chat_id=record.chat_id, text=record.content
+                                chat_id=record.chat_id,
+                                text=record.content,
+                                disable_notification=record.silent,
                             )
-                    else:
-                        message_id = await self._telegram.send_message(
-                            chat_id=record.chat_id, text=record.content
-                        )
                 except asyncio.CancelledError:
                     raise
                 except TelegramApiError as exc:
@@ -401,6 +467,9 @@ class TelegramCanonicalBridgeAdapter(BasePlatformAdapter):
                     logger.warning("[%s] Telegram outbox retry id=%s attempts=%s: %s", PLATFORM_NAME, record.id, attempts, exc)
                 else:
                     self._state.mark_outbox_sent(record.id, message_id)
+                    # 任一 Bot 訊息都會讓 Telegram 清除 typing；若工作仍活躍就立即重開。
+                    if self._state.chat_has_active_work(record.chat_id):
+                        await self.send_typing(record.chat_id)
 
     def _retry_delay(self, attempts: int) -> float:
         return min(

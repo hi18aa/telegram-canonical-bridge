@@ -29,6 +29,15 @@ class BridgeStateTests(unittest.TestCase):
         self.assertTrue(self.state.bind_active_route(controller_profile="default", chat_id="10", user_id="20"))
         self.assertFalse(self.state.bind_active_route(controller_profile="default", chat_id="11", user_id="21"))
 
+    def test_expired_processing_lease_is_reclaimed(self) -> None:
+        self.assertTrue(self.state.record_inbound(
+            update_id="lease-1", chat_id="10", user_id="20", message_id="30", text="hello"
+        ))
+        first = self.state.claim_due_inbound(lease_seconds=0)
+        self.assertEqual([record.update_id for record in first], ["lease-1"])
+        reclaimed = self.state.claim_due_inbound()
+        self.assertEqual([record.update_id for record in reclaimed], ["lease-1"])
+
     def test_bootstrap_does_not_replay_old_history_and_new_output_is_chunked(self) -> None:
         old = AssistantHistoryMessage(key="row:1", content_digest="old", text="舊回覆")
         self.assertEqual(self.state.record_history(
@@ -54,7 +63,7 @@ class BridgeStateTests(unittest.TestCase):
         self.state.mark_outbox_sent(retried.id, "999")
         self.assertEqual(self.state.counts()["pending_outbox"], 0)
 
-    def test_task_lifecycle_uses_one_editable_status_card_and_durable_inbox(self) -> None:
+    def test_task_lifecycle_uses_timeline_events_and_durable_inbox(self) -> None:
         self.assertTrue(self.state.bind_active_route(
             controller_profile="default", chat_id="10", user_id="20"
         ))
@@ -82,6 +91,7 @@ class BridgeStateTests(unittest.TestCase):
         self.assertEqual(len(initial_card), 1)
         self.assertEqual(initial_card[0].kind, "task_status")
         self.assertEqual(initial_card[0].task_id, task.id)
+        self.assertIn("後續進度會以新訊息發布", initial_card[0].content)
         self.state.mark_outbox_sent(initial_card[0].id, "telegram-card-1")
         self.assertEqual(self.state.task(task.id).telegram_message_id, "telegram-card-1")
         self.assertFalse(self.state.clear_task_telegram_message(
@@ -91,7 +101,7 @@ class BridgeStateTests(unittest.TestCase):
             task.id, expected_message_id="telegram-card-1"
         ))
         self.assertIsNone(self.state.task(task.id).telegram_message_id)
-        # 模擬 adapter 重建狀態卡後，新的 ID 仍會被綁定。
+        # 模擬 adapter 重建時間線錨點後，新的 ID 仍會被綁定。
         self.state.mark_outbox_sent(initial_card[0].id, "telegram-card-2")
         self.assertEqual(self.state.task(task.id).telegram_message_id, "telegram-card-2")
 
@@ -114,10 +124,19 @@ class BridgeStateTests(unittest.TestCase):
             progress="OT 已回報一般進度，但這不是最終結果。",
             evidence="OT explicit bridge_task_update",
         )
-        # 兩個快速 revision 應合併成一筆待 edit outbox。
-        edits = self.state.claim_due_outbox()
-        self.assertEqual(len(edits), 1)
-        self.state.mark_outbox_sent(edits[0].id, "telegram-card-1")
+        # lifecycle 與 OT 明確里程碑各自保留為不可變時間線事件。
+        events = []
+        for index in range(1, 4):
+            record = self.state.claim_due_outbox()[0]
+            events.append(record)
+            self.state.mark_outbox_sent(record.id, f"telegram-event-{index}")
+            self.assertEqual(
+                self.state.task_by_telegram_message(
+                    chat_id="10", telegram_message_id=f"telegram-event-{index}"
+                ).id,
+                task.id,
+            )
+        self.assertTrue(all(record.kind == "task_status" for record in events))
 
         updated, accepted, _detail = self.state.add_task_note(
             task_id=task.id,
@@ -188,6 +207,45 @@ class BridgeStateTests(unittest.TestCase):
         self.assertTrue(terminal.terminal)
         self.assertIn("已結束", detail)
 
+    def test_typing_activity_tracks_controller_turn_and_stops_after_reply(self) -> None:
+        self.assertTrue(self.state.record_inbound(
+            update_id="typing-1", chat_id="10", user_id="20", message_id="30", text="請處理"
+        ))
+        claimed = self.state.claim_due_inbound()
+        self.assertEqual(self.state.active_chat_ids(), ["10"])
+        self.state.mark_inbound_submitted(claimed[0].id)
+        self.assertEqual(self.state.active_chat_ids(), ["10"])
+
+        queued = self.state.record_history(
+            root_id="root",
+            messages=[AssistantHistoryMessage(key="reply:1", content_digest="digest", text="完成")],
+            chat_id="10",
+            bootstrap=False,
+        )
+        self.assertEqual(queued, 1)
+        self.assertEqual(self.state.active_chat_ids(), [])
+        reply = self.state.claim_due_outbox()[0]
+        self.assertEqual(reply.reply_to_message_id, "30")
+
+    def test_task_timeline_preserves_per_task_delivery_order(self) -> None:
+        task, _created = self.state.create_task(
+            chat_id="10",
+            origin_profile="default",
+            origin_session_id="controller-session",
+            origin_turn_id="controller-turn",
+            origin_tool_call_id="ordered-call",
+            target="worker",
+        )
+        self.state.acknowledge_dispatch(
+            session_id="controller-session",
+            tool_call_id="ordered-call",
+            process_id="process-ordered",
+        )
+        first = self.state.claim_due_outbox(limit=1)[0]
+        self.state.defer_outbox(first.id, error="temporary", delay_seconds=60)
+        # 第一則仍在 retry 時，同一任務的第二則不得越過它。
+        self.assertEqual(self.state.claim_due_outbox(), [])
+
     def test_startup_reconciles_unread_notes_left_on_closed_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "closed-notes.sqlite3"
@@ -246,9 +304,15 @@ class BridgeStateTests(unittest.TestCase):
             check = sqlite3.connect(path)
             try:
                 columns = {row[1] for row in check.execute("PRAGMA table_info(outbox)")}
+                inbound_columns = {
+                    row[1] for row in check.execute("PRAGMA table_info(inbound)")
+                }
             finally:
                 check.close()
-            self.assertIn("task_id", columns)
+            self.assertTrue({
+                "task_id", "reply_to_message_id", "silent"
+            }.issubset(columns))
+            self.assertTrue({"responded_at", "response_pending"}.issubset(inbound_columns))
 
 
 if __name__ == "__main__":
