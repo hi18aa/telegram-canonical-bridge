@@ -16,7 +16,12 @@ from datetime import datetime, timezone
 TASK_ID_RE = re.compile(r"^TCB-[0-9]{8}-[A-F0-9]{6}$", re.IGNORECASE)
 TASK_MARKER_RE = re.compile(r"\[TCB-TASK:(TCB-[0-9]{8}-[A-F0-9]{6})\]", re.IGNORECASE)
 
-TERMINAL_TASK_STATUSES = frozenset({"completed", "finished", "failed", "cancelled"})
+TERMINAL_TASK_STATUSES = frozenset(
+    {"completed", "unconfirmed", "finished", "failed", "cancelled"}
+)
+# ``finished`` 是 v0.3.x 已寫入 SQLite 的舊狀態；兩者都只代表缺少足夠證據，
+# 因此收到較晚的 worker hook／Hermes completion notification 時允許恢復追蹤。
+RECOVERABLE_TERMINAL_TASK_STATUSES = frozenset({"unconfirmed", "finished"})
 
 TASK_STATUS_LABELS = {
     "dispatching": "準備派工",
@@ -26,7 +31,8 @@ TASK_STATUS_LABELS = {
     "blocked": "需要協助",
     "returning": "OT 已產生回覆",
     "completed": "已完成",
-    "finished": "背景程序已結束（結果待確認）",
+    "unconfirmed": "執行結果未確認",
+    "finished": "執行結果未確認（舊版狀態）",
     "failed": "失敗",
     "cancelled": "已取消",
 }
@@ -61,6 +67,19 @@ class TaskRecord:
     @property
     def terminal(self) -> bool:
         return self.status in TERMINAL_TASK_STATUSES
+
+    @property
+    def worker_started(self) -> bool:
+        return bool(self.worker_session_id)
+
+    @property
+    def final_observed(self) -> bool:
+        evidence = self.evidence.lower()
+        return (
+            self.status == "returning"
+            or "post_llm_call" in evidence
+            or "with reply" in evidence
+        )
 
 
 @dataclass(frozen=True)
@@ -117,6 +136,8 @@ def render_task_card(task: TaskRecord) -> str:
         lines.append(f"留言：{task.pending_notes} 則待 OT 讀取")
     if task.process_id:
         lines.append(f"背景 handle：{task.process_id}")
+    lines.append(f"OT turn：{'已觀察啟動' if task.worker_started else '尚未觀察啟動'}")
+    lines.append(f"Final：{'已有可指認證據' if task.final_observed else '尚無證據'}")
     if task.exit_code is not None:
         lines.append(f"程序 exit code：{task.exit_code}")
     if task.last_error:
@@ -140,6 +161,7 @@ def render_task_event(task: TaskRecord) -> str:
         "blocked": "⚠️",
         "returning": "📬",
         "completed": "✅",
+        "unconfirmed": "⚠️",
         "finished": "⚠️",
         "failed": "❌",
         "cancelled": "⛔",
@@ -148,7 +170,7 @@ def render_task_event(task: TaskRecord) -> str:
         f"{emoji} 任務 {task.id}｜@{task.target.lstrip('@')}",
         f"{status}：{task.progress or '尚無進一步證據'}",
     ]
-    if task.last_error and task.status in {"blocked", "failed"}:
+    if task.last_error and task.status in {"blocked", "unconfirmed", "finished", "failed"}:
         lines.append(f"錯誤：{sanitize_progress(task.last_error, limit=280)}")
     if task.status == "dispatching":
         lines.append("後續進度會以新訊息發布；回覆任一任務訊息都可留言。")

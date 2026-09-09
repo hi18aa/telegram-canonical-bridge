@@ -15,6 +15,7 @@ from typing import Any, Iterable, Iterator
 
 from .protocol import AssistantHistoryMessage, split_telegram_text
 from .task_model import (
+    RECOVERABLE_TERMINAL_TASK_STATUSES,
     TASK_STATUS_LABELS,
     TERMINAL_TASK_STATUSES,
     TaskNote,
@@ -210,6 +211,11 @@ class BridgeState:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS outbox_task_status "
                 "ON outbox(task_id, kind, status)"
+            )
+            # v0.3.x 把缺乏 final／exit 證據的 runner 寫成 ``finished``；新語意
+            # 改為明確的 ``unconfirmed``，避免 API 使用者誤認成成功終態。
+            connection.execute(
+                "UPDATE bridge_tasks SET status = 'unconfirmed' WHERE status = 'finished'"
             )
 
     @staticmethod
@@ -608,7 +614,10 @@ class BridgeState:
 
         content = render_task_event(task)
         dedup_key = f"task-event:{task.id}:revision:{task.revision}"
-        silent = int(task.status not in {"blocked", "failed", "cancelled", "finished", "completed"})
+        silent = int(
+            task.status
+            not in {"blocked", "unconfirmed", "failed", "cancelled", "finished", "completed"}
+        )
         connection.execute(
             "INSERT OR IGNORE INTO outbox("
             "chat_id, dedup_key, content, kind, task_id, status, silent, created_at) "
@@ -642,6 +651,11 @@ class BridgeState:
     ) -> None:
         if count <= 0:
             return
+        closure = (
+            "已產生最終回覆"
+            if task.status in {"returning", "completed"}
+            else f"已進入「{TASK_STATUS_LABELS.get(task.status, task.status)}」"
+        )
         connection.execute(
             "INSERT OR IGNORE INTO outbox(chat_id, dedup_key, content, kind, status, created_at) "
             "VALUES (?, ?, ?, 'notice', 'pending', ?)",
@@ -649,7 +663,7 @@ class BridgeState:
                 task.chat_id,
                 f"task-notes-missed:{task.id}",
                 (
-                    f"⚠️ 任務 {task.id} 已產生最終回覆；OT 未及讀取 {count} 則任務留言，"
+                    f"⚠️ 任務 {task.id} {closure}；OT 未及讀取 {count} 則任務留言，"
                     "內容未納入本次結果。請把需求另傳成 Controller 的新訊息。"
                 ),
                 time.time(),
@@ -705,7 +719,11 @@ class BridgeState:
         exit_code: int | None = None,
         last_error: str | None = None,
     ) -> TaskRecord | None:
-        """原子更新任務與狀態卡；終態不會被較晚的 observer 降級。"""
+        """原子更新任務與狀態卡；確定終態不會被較晚的 observer 降級。
+
+        ``unconfirmed``／舊版 ``finished`` 不是成功或失敗證明。若稍後才收到
+        worker hook 或 Hermes completion notification，允許它恢復成可判定狀態。
+        """
 
         normalized = normalize_task_id(task_id)
         if not normalized:
@@ -716,7 +734,12 @@ class BridgeState:
             current = self._task_locked(connection, normalized)
             if current is None:
                 return None
-            if current.terminal:
+            recovering = (
+                current.status in RECOVERABLE_TERMINAL_TASK_STATUSES
+                and status is not None
+                and status != current.status
+            )
+            if current.terminal and not recovering:
                 return current
 
             changes: dict[str, Any] = {}
@@ -754,6 +777,8 @@ class BridgeState:
             next_status = str(changes.get("status", current.status))
             if next_status in TERMINAL_TASK_STATUSES:
                 changes["finished_at"] = now
+            elif current.status in RECOVERABLE_TERMINAL_TASK_STATUSES:
+                changes["finished_at"] = None
             assignments = ", ".join(f"{field} = ?" for field in changes)
             connection.execute(
                 f"UPDATE bridge_tasks SET {assignments} WHERE task_id = ?",
@@ -777,16 +802,57 @@ class BridgeState:
         session_id: str,
         tool_call_id: str,
         process_id: str,
+        delivery_status: str = "sent",
     ) -> TaskRecord | None:
         task = self.find_task_by_origin_call(session_id, tool_call_id)
         if task is None:
             return None
+        queued = str(delivery_status or "").lower() == "queued"
         return self.transition_task(
             task.id,
-            status="dispatched",
+            status="waiting" if queued else "dispatched",
             process_id=process_id,
-            progress="Hermes 已接受派工，背景程序已建立。",
-            evidence="message_agent acknowledgement",
+            progress=(
+                "Hermes 已持久化收件並排入目標 Bot Chat；尚未證明 OT turn 已啟動。"
+                if queued
+                else "Hermes 已接受派工，背景 runner 已建立；尚未證明 OT turn 已啟動。"
+            ),
+            evidence=(
+                "message_agent queued acknowledgement"
+                if queued
+                else "message_agent sent acknowledgement"
+            ),
+        )
+
+    def acknowledge_without_process(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+        delivery_status: str,
+    ) -> TaskRecord | None:
+        """處理新版 queued 回條或無 handle 的不完整 acknowledgement。"""
+
+        task = self.find_task_by_origin_call(session_id, tool_call_id)
+        if task is None:
+            return None
+        queued = str(delivery_status or "").lower() == "queued"
+        return self.transition_task(
+            task.id,
+            status="waiting" if queued else "unconfirmed",
+            progress=(
+                "Hermes 已持久化收件並排入目標 Bot Chat；尚未觀察 OT turn 啟動。"
+                if queued
+                else "message_agent 回傳成功形狀，但沒有 process handle；bridge 無法追蹤 runner。"
+            ),
+            evidence=(
+                "message_agent queued acknowledgement (no process handle)"
+                if queued
+                else "message_agent acknowledgement missing process handle"
+            ),
+            last_error=(
+                "" if queued else "派工結果未確認；等待較晚的 OT worker hook。"
+            ),
         )
 
     def fail_dispatch(
@@ -836,6 +902,20 @@ class BridgeState:
             ).fetchone()
         return self._task_from_row(row) if row else None
 
+    def task_by_process_id(self, process_id: str) -> TaskRecord | None:
+        """依 Hermes opaque background handle 找到最近一筆追蹤任務。"""
+
+        candidate = str(process_id or "").strip()
+        if not candidate:
+            return None
+        with self._read_connection() as connection:
+            row = connection.execute(
+                self._task_select()
+                + "WHERE t.process_id = ? ORDER BY t.created_at DESC LIMIT 1",
+                (candidate,),
+            ).fetchone()
+        return self._task_from_row(row) if row else None
+
     def tasks_requiring_process_poll(self, *, limit: int = 32) -> list[TaskRecord]:
         placeholders = ",".join("?" for _ in TERMINAL_TASK_STATUSES)
         with self._read_connection() as connection:
@@ -851,7 +931,9 @@ class BridgeState:
         self, task_id: str, *, process_status: str, exit_code: int | None
     ) -> TaskRecord | None:
         task = self.task(task_id)
-        if task is None or task.terminal:
+        if task is None or (
+            task.terminal and task.status not in RECOVERABLE_TERMINAL_TASK_STATUSES
+        ):
             return task
         normalized_status = str(process_status or "").lower()
         if normalized_status == "running":
@@ -859,43 +941,50 @@ class BridgeState:
                 return task
             return self.transition_task(
                 task.id,
-                status="running",
-                progress="Hermes 背景派工程序仍在執行；這不代表特定 UI 已開啟。",
-                evidence="agents.list: running",
+                progress=(
+                    "Hermes 背景派工 runner 仍在執行；尚未觀察到 OT turn 啟動，"
+                    "也不代表任何 UI 已開啟。"
+                ),
+                evidence="agents.list: runner running (worker not observed)",
             )
         if normalized_status == "exited":
-            if exit_code is None:
-                if task.status == "returning":
-                    return self.transition_task(
-                        task.id,
-                        status="completed",
-                        progress=task.progress or "OT 已產生最終回覆，且背景程序已結束。",
-                        evidence="post_llm_call + agents.list: exited",
-                    )
-                return self.transition_task(
-                    task.id,
-                    status="finished",
-                    progress="背景程序已結束，但沒有 final hook 或 exit code，bridge 無法判定結果。",
-                    evidence="agents.list: exited (exit code unavailable)",
-                )
-            if int(exit_code) == 0:
+            if (
+                task.evidence == "Hermes completion notification: live delivery queued"
+                and exit_code in {None, 0}
+            ):
+                # runner 的工作只到 durable admission；真正 OT turn 可能仍排在
+                # live Bot Chat 佇列後方，不能用 runner exited 覆寫這份較強證據。
+                return task
+            if task.status == "returning":
                 return self.transition_task(
                     task.id,
                     status="completed",
-                    progress=(
-                        task.progress
-                        or "OT turn 的背景程序已成功結束，但沒有可顯示的結果摘要。"
-                    ),
-                    evidence="process telemetry: exited (exit 0)",
-                    exit_code=0,
+                    progress=task.progress or "OT 已產生最終回覆，且背景 runner 已結束。",
+                    evidence="post_llm_call + agents.list: exited",
+                    exit_code=exit_code,
+                )
+            if exit_code is not None and int(exit_code) != 0:
+                return self.transition_task(
+                    task.id,
+                    status="failed",
+                    progress="背景派工 runner 以非零 exit code 結束；OT turn 未完成。",
+                    evidence="process telemetry: exited",
+                    exit_code=int(exit_code),
+                    last_error=f"background process exit code {int(exit_code)}",
                 )
             return self.transition_task(
                 task.id,
-                status="failed",
-                progress="OT turn 的背景程序以非零 exit code 結束。",
-                evidence="process telemetry: exited",
-                exit_code=int(exit_code),
-                last_error=f"background process exit code {int(exit_code)}",
+                status="waiting",
+                progress=(
+                    "背景派工 runner 已結束，但 bridge 尚未觀察到 OT final；"
+                    "正在等待 Hermes 的正式完成通知判定結果。"
+                    if task.worker_session_id
+                    else
+                    "背景派工 runner 已結束，但尚未觀察到 OT turn 啟動；"
+                    "正在等待 Hermes 的正式完成通知判定結果。"
+                ),
+                evidence="agents.list: exited; awaiting completion notification",
+                exit_code=exit_code,
             )
         if normalized_status == "absent_after_final" and task.status == "returning":
             return self.transition_task(
@@ -903,6 +992,23 @@ class BridgeState:
                 status="completed",
                 progress=task.progress or "OT 已產生最終回覆。",
                 evidence="post_llm_call + agents.list: absent after grace",
+            )
+        if normalized_status in {"unconfirmed_after_grace", "absent_without_final"}:
+            return self.transition_task(
+                task.id,
+                status="unconfirmed",
+                progress=(
+                    "未觀察到 OT turn 啟動或最終回覆；runner 已結束或不再出現在 Hermes 摘要中。"
+                    if not task.worker_session_id
+                    else
+                    "曾觀察到 OT turn 啟動，但沒有 final hook；runner 已結束或不再出現在 Hermes 摘要中。"
+                ),
+                evidence=(
+                    "runner absent/exited after grace; no worker final evidence"
+                ),
+                last_error=(
+                    "執行結果未知；不要把這個狀態當成完成，也不要盲目重派。"
+                ),
             )
         return task
 

@@ -8,13 +8,14 @@
 
 Hermes Controller 可透過 `message_agent` 把工作非同步派給 OT（其他 profile／bot），但原生回傳的 `sent` 只代表背景派工已建立：它不代表 OT 已完成，也不能證明瀏覽器已開啟。Telegram 使用者因此只能等最終回覆，不容易分辨工作是執行中、卡住，或已失敗。
 
-V3 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調與 Telegram 活動呈現：
+V4 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調與 Telegram 活動呈現：
 
 - Telegram 訊息仍進入同一個 canonical `Bot Chat`，不建立一般 Telegram session。
 - 收到一般文字後立即回覆 ACK；Controller 或 OT 有活動證據時，每 4 秒續期 Telegram 原生「正在輸入…」。
 - Controller 派工時建立 `TCB-...` 任務；重要狀態、明確里程碑與最終結果以新訊息形成時間線，不再默默改寫同一張卡。
 - 使用者可回覆任一任務時間線訊息或使用 `/tell` 留言；OT 在工作檢查點透過 durable inbox 讀取。
 - 任務、事件、留言與待送訊息存放在共用 SQLite；Controller 與 named profile 看到同一份 ledger。
+- 以 process ID 關聯 Hermes 正式的背景完成通知，補回 `agents.list` 沒有提供的 exit code、類型化失敗原因，以及可辨識的遠端 OT 回覆。
 - 不修改 Hermes core，也不覆寫內建工具，降低 Hermes 更新造成失效的範圍。
 
 ## 能知道什麼，不能知道什麼
@@ -22,13 +23,16 @@ V3 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調與 T
 | 顯示狀態 | 實際證據 | 不應解讀成 |
 | --- | --- | --- |
 | 準備派工 | `pre_tool_call` 已建立任務 | OT 已收到 |
-| 已排入背景程序 | 原生 `message_agent` 回傳 `sent` 與 process handle | OT 已完成 |
-| OT 處理中 | OT turn 開始、背景程序為 running，或觀察到工具呼叫 | 特定 UI 已成功開啟 |
+| 已排入背景程序 | 原生 `message_agent` 回傳 `sent` 與 process handle | 訊息已交付、OT 已啟動或已完成 |
+| Runner 執行中 | `agents.list` 顯示背景 handle 為 running | OT turn 已啟動或特定 UI 已開啟 |
+| OT 處理中 | OT 的 `pre_llm_call` 已綁定任務；之後才可能觀察到 OT 工具呼叫 | 特定工具或網站已成功 |
+| 等待收件／完成通知 | Hermes 回傳 durable `queued`／live Bot Chat 收件回條，或 runner 已退出但正式完成通知尚未抵達 | OT 已完成 |
 | 明確進度 | OT 呼叫 `bridge_task_update` 回報可驗證里程碑；最終里程碑使用 `status=result` | OT 的內部思考或逐 token 串流 |
 | 最終結果保底 | `post_llm_call` 的 final assistant response 經清理、截短後寫入任務時間線；`status=result` 的明確結果優先 | Controller 已收到 Hermes 背景通知 |
 | OT 已產生回覆 | OT `post_llm_call` 已執行 | Controller 已收到 Hermes 原生通知 |
-| 已完成 | OT 已產生 final，且程序為 exited 或經 grace 後不再出現在全域摘要；也可由 exit code 0 證明 | Controller 已收到原生通知，或每個外部系統都一定成功 |
-| 結果待確認 | 程序已結束，但全域摘要沒有 exit code／final hook | 工作成功或失敗 |
+| 已完成 | OT `post_llm_call` 已產生 final 且 runner 結束，或 Hermes 完成通知帶有 exit 0 與可辨識的 OT 回覆 | 每個外部系統都一定成功 |
+| 失敗 | Hermes 完成通知／process telemetry 提供非零 exit code，或 worker hook 明確失敗 | 可以安全地自動重派 |
+| 執行結果未確認 | grace 後仍沒有 OT 啟動、final、exit code 或可辨識回覆 | 工作成功或失敗；尤其不可當成完成 |
 
 這不是遠端桌面監看，也不會公開 chain-of-thought。若 OT 要說「頁面已開啟」，仍必須先有相應工具成功的結果。typing 與時間線提供的是可驗證的生命週期，不是假裝能看見 agent 的每一步。
 
@@ -36,6 +40,8 @@ V3 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調與 T
 
 - **Controller 端：同一個 session。** Telegram 文字送到指定 profile 既有的 canonical `Bot Chat`，因此延續原本上下文與 Bot Mode。
 - **OT 端：訊息進入目標 OT 自己的 canonical `Bot Chat`，但每次呼叫都是新的非同步背景 turn／process。** canonical 對話會延續；它仍不是一條可隨時插話的長連線，runtime ID 也可能因壓縮或重啟而輪替。
+- **不同 Controller 呼叫同一個 OT：** 都進入該 OT 同一個 canonical `Bot Chat` 歷史，但每次是不同的 task ID／turn／runner。Hermes 負責依 Bot Chat 佇列序列化，不應同時寫同一段 session。
+- **跨電腦：** 每台機器的 SQLite ledger 不會自動共享。遠端 OT 的逐步 hook 進度與 `/tell` inbox 不能跨機器同步；sender 端仍可在 Hermes 背景完成通知帶回 reply 時完成任務。長時間、需要可查狀態與防重複的跨機工作，優先使用 Hermes `peer run`／`peer status`。
 - **Hermes 仍負責上下文壓縮。** 外掛不關閉或取代 Hermes 的 compaction；canonical runtime ID 改變時會重新解析 binding。
 - **任務 ledger 不跟著對話壓縮。** 任務狀態、留言及必要時清理後的 OT 最終答覆摘要會獨立存放於 SQLite；它不是完整聊天記憶，也不保存 OT 私密思考、conversation history 或原始工具資料。
 
@@ -76,6 +82,7 @@ Controller canonical history    shared SQLite
 
 - Python 3.11 以上。
 - 支援原生 plugin tools 與 hooks 的 Hermes；本版已在 Hermes `0.21.0` 驗證。
+- 若目標 Bot Chat 會長時間開在 Desktop／TUI，Hermes backend 應包含 2026-09-02 之後的 live Bot Chat delivery 修正；舊 backend 可能先回 `sent`，之後才以 `target_busy` 失敗。V4 會如實顯示失敗，但外掛不會修改 Hermes core 來繞過 session ownership。
 - 一個專用 Telegram bot，及可信任使用者的 numeric Telegram User ID。
 - 目標 Controller profile 已有可用的 canonical `Bot Chat`。
 - 本機 `hermes serve` WebSocket backend；建議只監聽 loopback。
@@ -200,7 +207,8 @@ hermes gateway restart
 3. Controller 呼叫原生 `message_agent` 後，Bot 送出第一則 `TCB-...` 任務事件。
 4. 後續狀態與明確里程碑以新訊息加入時間線；需要補充時可回覆其中任何一則。
 5. OT 的明確最終里程碑會留在時間線；若 OT 漏掉主動回報，bridge 會以 `post_llm_call` 的清理後最終答覆補上。
-6. Hermes 原生背景通知若成功喚醒 Controller，Controller 後續回覆仍會透過 canonical history 傳到 Telegram；任務時間線不依賴這條路徑才有結果。
+6. Hermes 原生背景完成通知會依 process ID 回填 exit code。exit 0 只有在同時有 final／可辨識 OT reply 時才結案；live Bot Chat 的排隊回條只會顯示等待。
+7. Controller 對完成通知產生的後續回覆，仍會透過 canonical history 傳到 Telegram。
 
 ## 驗收
 
@@ -249,6 +257,7 @@ SQLite ledger 不會因停用 plugin 自動刪除。確認不再需要歷史與�
 - token 不寫入 URL、SQLite 或 log；backend 建議只綁定 `127.0.0.1`。
 - SQLite 可能含 Telegram ID、輸入內容、回覆及任務留言，請視為敏感本機資料。
 - 對已追蹤任務，OT 的 final assistant response 可能被截短、清理後顯示給同一位 allowlisted Telegram 使用者；`bridge_task_update(status=result)` 的明確最終里程碑會優先，且不會保存 conversation history、原始 tool args/result 或 chain-of-thought。
+- Hermes completion notification 為 exit 0 時，bridge 只擷取 runner stdout 中可辨識的 OT reply 並清理／截短；非零 exit 的原始 command、stack trace 與任意輸出不會複製到 Telegram，只顯示類型化失敗原因。
 - typing 只在 Controller 有未完成回覆或 task 有活動狀態證據時續期；它代表「bridge 有工作中證據」，不代表某個特定視窗已開啟。
 - Hook 故障採 fail-open：原生 `message_agent` 仍可執行，但該次狀態追蹤可能不完整。
 - 事件 replay 是生命週期加速與補漏；Controller 自己的 assistant 回覆仍由持久 `session.history` 回收，OT 任務結果則由明確進度或 final hook 保底。
@@ -259,9 +268,18 @@ SQLite ledger 不會因停用 plugin 自動刪除。確認不再需要歷史與�
 - 一個 Controller profile 只綁定一個 Telegram 私訊 route。
 - `/tell` 不會中斷正在執行的工具；讀取速度取決於 OT 是否到達 inbox 檢查點。
 - OT 產生 final 時仍未讀的留言會標為 `missed` 並另發警告；它們不會被偷偷套用到已結束的工作。
-- Hermes 原生背景完成通知是否喚醒 Controller，取決於當時是否仍有合適的 live session owner；bridge 不偽造這項保證，耐久結果面是 Telegram 任務時間線。
+- Hermes 若沒有把背景完成通知送回原始 Controller session，bridge 最多只能根據 hook 與全域摘要判定；缺少足夠證據時會進入「執行結果未確認」，不會自動重派。
 - Hermes 的事件 replay 是有界 buffer；重啟或長時間中斷後可能缺少中間狀態，但 SQLite 中的 final hook 結果與 process 狀態仍可恢復主要任務狀態。
-- `completed` 是 final hook 加程序 exited／經 grace 後已不在全域摘要，或 exit code 0 的證據，不是 Controller 收到原生通知或任務內容正確性的保證；缺少足夠證據時會顯示「結果待確認」。
+- 單獨的 `sent`、runner running、runner exited 或 exit code 0 都不再足以證明 OT 完成；缺少 final／reply 證據時會停在等待或「執行結果未確認」。
+- 跨電腦時，逐步 hook telemetry 與 task inbox 不會穿越兩台機器各自的 SQLite；可攜的結果來源是 Hermes 自己帶回 sender 的 completion reply。
+
+## `sent` 後沒有 OT 動靜時
+
+先用 `/task TCB-...` 看 `OT turn`、`Final`、exit code 與 evidence：
+
+- `OT turn：尚未觀察啟動` 且稍後出現 `target_busy`：更新並重啟**目標電腦**的 Hermes backend；訊息沒有進入 OT，不要把它當成網站流程失敗。
+- `執行結果未確認`：bridge 沒拿到足以判斷的完成證據。不要盲目重派有外部副作用的工作；先查目標 Bot Chat 是否新增 assistant/tool row、`hermes --version`、`hermes plugins list` 與目標 backend log。
+- `OT turn：已觀察啟動` 但 `Final：尚無證據`：runner／provider 在 turn 中途終止，或目標外掛 hook 沒有載入；在該 OT profile 執行 `hermes -p <profile> plugins doctor --ci <plugin-path>`。
 
 更完整的資料模型、相容性策略與故障行為見 [`docs/實作設計與驗收.md`](docs/實作設計與驗收.md)。
 
@@ -282,7 +300,7 @@ hermes plugins compat .
 4. Add the root-level `platforms.telegram_canonical_bridge` block with an explicit user allowlist.
 5. Run `hermes serve` on loopback and restart the gateway.
 
-The Controller keeps its existing canonical Bot Chat, and a local message is delivered into the target worker's own canonical Bot Chat. Each `message_agent` call is still a separate asynchronous background turn/process; the plugin does not turn it into a live duplex connection. By default, the bot acknowledges new input, refreshes Telegram's native typing action while evidence says work is active, and posts meaningful task updates as new timeline messages. Set `task_presentation: compact` to retain the legacy editable-card view. `/tell` and replies to any task event create a durable note that the worker reads at explicit checkpoints. Hermes remains responsible for context compaction.
+The Controller keeps its existing canonical Bot Chat, and a local message is delivered into the target worker's own canonical Bot Chat. Each `message_agent` call is a separate asynchronous turn/process while the target's canonical conversation remains shared and persistent. V4 distinguishes a spawned runner from a started worker turn, correlates Hermes completion notifications by process ID, and never treats `sent`, runner activity, or exit 0 alone as proof that the worker finished. Cross-machine workers do not share the local SQLite ledger; their portable fallback is the reply carried back by Hermes' completion notification. Set `task_presentation: compact` for the legacy editable-card view. `/tell` is a checkpoint inbox, not a live interrupt. Hermes remains responsible for context compaction.
 
 ## License
 

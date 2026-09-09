@@ -17,6 +17,9 @@ from .state import BridgeState, InboundRecord
 
 logger = logging.getLogger(__name__)
 RETURNING_PROCESS_MISSING_GRACE_SECONDS = 15.0
+PROCESS_COMPLETION_NOTICE_GRACE_SECONDS = 30.0
+DISPATCH_START_GRACE_SECONDS = 90.0
+LIVE_DELIVERY_START_GRACE_SECONDS = 300.0
 
 
 class CanonicalUnavailable(RuntimeError):
@@ -257,12 +260,21 @@ class CanonicalBridgeService:
                     result = {}
             result = result if isinstance(result, dict) else {}
             process_id = str(result.get("process_id") or "").strip()
-            if result.get("status") == "sent" and process_id:
-                self.state.acknowledge_dispatch(
-                    session_id=handle.runtime_id,
-                    tool_call_id=tool_call_id,
-                    process_id=process_id,
-                )
+            delivery_status = str(result.get("status") or "").strip().lower()
+            if delivery_status in {"sent", "queued"}:
+                if process_id:
+                    self.state.acknowledge_dispatch(
+                        session_id=handle.runtime_id,
+                        tool_call_id=tool_call_id,
+                        process_id=process_id,
+                        delivery_status=delivery_status,
+                    )
+                else:
+                    self.state.acknowledge_without_process(
+                        session_id=handle.runtime_id,
+                        tool_call_id=tool_call_id,
+                        delivery_status=delivery_status,
+                    )
                 changed += 1
             elif result.get("error"):
                 self.state.fail_dispatch(
@@ -298,6 +310,7 @@ class CanonicalBridgeService:
         for task in tasks:
             if not task.process_id:
                 continue
+            age = time.time() - task.updated_at
             row = processes.get(task.process_id)
             if row is None:
                 # agents.list 是短生命週期全域摘要；process 結束或 backend
@@ -315,18 +328,62 @@ class CanonicalBridgeService:
                     )
                     if updated and updated.status != task.status:
                         changed += 1
+                elif task.status == "waiting":
+                    grace = (
+                        LIVE_DELIVERY_START_GRACE_SECONDS
+                        if task.evidence
+                        == "Hermes completion notification: live delivery queued"
+                        else PROCESS_COMPLETION_NOTICE_GRACE_SECONDS
+                    )
+                    if age >= grace:
+                        updated = self.state.observe_process(
+                            task.id,
+                            process_status="unconfirmed_after_grace",
+                            exit_code=task.exit_code,
+                        )
+                        if updated and updated.status != task.status:
+                            changed += 1
+                elif (
+                    task.status in {"dispatching", "dispatched", "running"}
+                    and age >= DISPATCH_START_GRACE_SECONDS
+                ):
+                    updated = self.state.observe_process(
+                        task.id,
+                        process_status="absent_without_final",
+                        exit_code=task.exit_code,
+                    )
+                    if updated and updated.status != task.status:
+                        changed += 1
                 continue
             raw_exit = row.get("exit_code")
             try:
                 exit_code = int(raw_exit) if raw_exit is not None else None
             except (TypeError, ValueError):
                 exit_code = None
+            process_status = str(row.get("status") or "")
             before = (task.status, task.progress, task.exit_code)
-            updated = self.state.observe_process(
-                task.id,
-                process_status=str(row.get("status") or ""),
-                exit_code=exit_code,
+            waiting_grace = (
+                LIVE_DELIVERY_START_GRACE_SECONDS
+                if task.evidence
+                == "Hermes completion notification: live delivery queued"
+                else PROCESS_COMPLETION_NOTICE_GRACE_SECONDS
             )
+            if (
+                process_status.lower() == "exited"
+                and task.status == "waiting"
+                and age >= waiting_grace
+            ):
+                updated = self.state.observe_process(
+                    task.id,
+                    process_status="unconfirmed_after_grace",
+                    exit_code=exit_code,
+                )
+            else:
+                updated = self.state.observe_process(
+                    task.id,
+                    process_status=process_status,
+                    exit_code=exit_code,
+                )
             if updated and (updated.status, updated.progress, updated.exit_code) != before:
                 changed += 1
         return changed

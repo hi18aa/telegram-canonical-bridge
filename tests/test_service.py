@@ -182,7 +182,8 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 self.assertGreaterEqual(await service.sync_task_telemetry(), 1)
                 running = state.task(task.id)
                 self.assertEqual(running.process_id, "process-1")
-                self.assertEqual(running.status, "running")
+                self.assertEqual(running.status, "dispatched")
+                self.assertIn("尚未觀察到 OT turn", running.progress)
                 self.assertNotIn("session.resume", [method for method, _ in backend.calls])
 
                 state.bind_worker(
@@ -273,7 +274,14 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 )
 
                 self.assertEqual(await service.sync_task_telemetry(), 1)
-                self.assertEqual(state.task(nested.id).status, "finished")
+                self.assertEqual(state.task(nested.id).status, "waiting")
+                self.assertIn("尚未觀察到 OT turn", state.task(nested.id).progress)
+                with patch(
+                    "telegram_canonical_bridge.service.PROCESS_COMPLETION_NOTICE_GRACE_SECONDS",
+                    0,
+                ):
+                    self.assertEqual(await service.sync_task_telemetry(), 1)
+                self.assertEqual(state.task(nested.id).status, "unconfirmed")
                 self.assertIn("agents.list", [method for method, _params in backend.calls])
 
         asyncio.run(scenario())

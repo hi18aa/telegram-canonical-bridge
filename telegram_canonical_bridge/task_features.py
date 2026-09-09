@@ -1,6 +1,6 @@
 """Hermes hooks 與 OT 可呼叫的任務狀態工具。
 
-V3 不覆寫 message_agent。它只在原生呼叫前加入 opaque task marker，並以
+V4 不覆寫 message_agent。它只在原生呼叫前加入 opaque task marker，並以
 Hermes 公開 hook／tool API 把可驗證的狀態寫入共用 SQLite ledger。
 """
 
@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,243 @@ MESSAGE_AGENT_MAX_CHARS = 16_000
 _STATE_CACHE: dict[Path, BridgeState] = {}
 _STATE_CACHE_LOCK = threading.Lock()
 
+
+@dataclass(frozen=True)
+class _ProcessCompletion:
+    process_id: str
+    exit_code: int | None
+    output: str
+    reason: str
+
+
+_CURRENT_COMPLETION_RE = re.compile(
+    r"^\s*\[IMPORTANT:\s*Background process\s+"
+    r"(?P<process_id>[A-Za-z0-9_.:-]+)\s+.*?"
+    r"\(exit code\s+(?P<exit_code>-?\d+|\?)(?:,[^)]+)?\)\.",
+    re.IGNORECASE | re.DOTALL,
+)
+_LEGACY_COMPLETION_RE = re.compile(
+    r"^\s*\[Background process\s+(?P<process_id>[A-Za-z0-9_.:-]+)\s+"
+    r"finished with exit code\s+(?P<exit_code>-?\d+|\?)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REASON_RE = re.compile(r"\[reason:\s*([a-z0-9_-]+)\]", re.IGNORECASE)
+
+
+def _parse_process_completion(value: object) -> _ProcessCompletion | None:
+    """讀取 Hermes 公開的背景完成通知；格式不符時完全忽略。
+
+    同時接受目前的 ``[IMPORTANT: ... Output:]`` 與舊版 gateway 的
+    ``[Background process ... Here's the final output:]`` 形狀。解析器只用
+    opaque process ID 做 ledger 關聯，不讀 Command 欄位。
+    """
+
+    text = str(value or "")
+    match = _CURRENT_COMPLETION_RE.match(text) or _LEGACY_COMPLETION_RE.match(text)
+    if match is None:
+        return None
+    raw_exit = match.group("exit_code")
+    exit_code = int(raw_exit) if raw_exit != "?" else None
+    output = ""
+    for delimiter in ("\nOutput:\n", "Here's the final output:\n"):
+        position = text.find(delimiter, match.end())
+        if position >= 0:
+            output = text[position + len(delimiter):].rstrip()
+            if output.endswith("]"):
+                output = output[:-1].rstrip()
+            break
+    reason_match = _REASON_RE.search(output)
+    reason = reason_match.group(1).lower() if reason_match else ""
+    if not reason:
+        try:
+            payload = json.loads(output)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            reason = str(payload.get("reason") or "").strip().lower()
+    if not reason and "already has a live owner" in output.lower():
+        reason = "target_busy"
+    return _ProcessCompletion(
+        process_id=match.group("process_id"),
+        exit_code=exit_code,
+        output=output,
+        reason=reason,
+    )
+
+
+def _is_live_delivery_ack(output: str) -> bool:
+    lowered = output.lower()
+    if "open bot chat" in lowered and "reply will appear there" in lowered:
+        return True
+    try:
+        payload = json.loads(output)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and str(payload.get("status") or "").lower() == "queued"
+
+
+def _completion_reply_summary(output: str) -> str:
+    """擷取 runner stdout 中預期可回給原提問者的 agent 答覆。
+
+    非零 exit 的任意輸出不會走到此函式；錯誤只以類型化原因呈現，避免把
+    command、stack trace 或意外秘密複製到 Telegram。
+    """
+
+    text = str(output or "").strip()
+    if not text or text == "(empty reply)" or _is_live_delivery_ack(text):
+        return ""
+    reply_match = re.search(r"(?:^|\n)Reply from [^\n]+:\s*\n(?P<reply>[\s\S]+)$", text)
+    if reply_match:
+        text = reply_match.group("reply").strip()
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().lower().startswith(
+            ("warning: unknown toolsets:", "resuming session:", "session id:")
+        )
+    ]
+    return sanitize_progress("\n".join(lines), limit=1000)
+
+
+def _completion_failure_message(completion: _ProcessCompletion) -> tuple[str, str]:
+    reason = completion.reason or "unknown"
+    messages = {
+        "target_busy": (
+            "目標 Bot Chat 被其他 surface 持有，背景 runner 未能啟動 OT turn。",
+            "請升級並重啟目標 Hermes backend；不要把 sent acknowledgement 當成已交付。",
+        ),
+        "runtime_offline": (
+            "目標 Hermes runtime 離線，背景派工未完成。",
+            "目標 runtime 離線。",
+        ),
+        "delivery_timeout": (
+            "等待目標回覆逾時，bridge 無法確認 OT 是否完成。",
+            "delivery timeout；不要盲目重派。",
+        ),
+        "queued_expired": (
+            "Hermes 的排隊派工已過期，OT turn 未完成。",
+            "queued delivery expired。",
+        ),
+        "provider_auth_or_access": (
+            "OT provider 驗證或存取失敗，沒有完成回覆。",
+            "provider authentication/access failure。",
+        ),
+        "provider_quota_limit": (
+            "OT provider 額度不足，沒有完成回覆。",
+            "provider quota limit。",
+        ),
+        "provider_rate_limit": (
+            "OT provider 暫時限流，沒有完成回覆。",
+            "provider rate limit。",
+        ),
+        "provider_server_error": (
+            "OT provider 發生伺服器錯誤，沒有完成回覆。",
+            "provider server error。",
+        ),
+        "missing_config": (
+            "OT 缺少執行所需設定，沒有開始或完成 turn。",
+            "target profile configuration is incomplete。",
+        ),
+        "model_unavailable": (
+            "OT 指定模型不可用，沒有完成回覆。",
+            "target model unavailable。",
+        ),
+        "context_overflow": (
+            "OT 對話 context overflow，重試後仍未完成。",
+            "target context overflow。",
+        ),
+        "unknown": (
+            "背景派工 runner 失敗，且 Hermes 未提供可分類原因。",
+            "runner failed；請查看目標 Hermes log 與 Controller 的完成通知。",
+        ),
+    }
+    return messages.get(reason, messages["unknown"])
+
+
+def _observe_process_completion(state: BridgeState, value: object) -> bool:
+    completion = _parse_process_completion(value)
+    if completion is None:
+        return False
+    task = state.task_by_process_id(completion.process_id)
+    if task is None:
+        return True
+
+    if completion.exit_code is not None and completion.exit_code != 0:
+        if task.status == "returning":
+            state.transition_task(
+                task.id,
+                status="completed",
+                evidence=(
+                    "hook:post_llm_call + Hermes completion notification "
+                    f"(exit {completion.exit_code})"
+                ),
+                exit_code=completion.exit_code,
+            )
+            return True
+        progress, detail = _completion_failure_message(completion)
+        state.transition_task(
+            task.id,
+            status="failed",
+            progress=progress,
+            evidence=(
+                "Hermes completion notification: exit "
+                f"{completion.exit_code}; reason={completion.reason or 'unknown'}"
+            ),
+            exit_code=completion.exit_code,
+            last_error=detail,
+        )
+        return True
+
+    if completion.exit_code == 0 and _is_live_delivery_ack(completion.output):
+        state.transition_task(
+            task.id,
+            status="waiting",
+            progress=(
+                "Hermes 已把訊息排入目標的 live Bot Chat；這只是持久化收件回條，"
+                "尚未證明 OT turn 已啟動或完成。"
+            ),
+            evidence="Hermes completion notification: live delivery queued",
+            exit_code=0,
+        )
+        return True
+
+    if completion.exit_code == 0:
+        summary = _completion_reply_summary(completion.output)
+        if task.status == "returning" or summary:
+            state.transition_task(
+                task.id,
+                status="completed",
+                progress=(
+                    task.progress
+                    if task.status == "returning"
+                    else f"OT runner 回覆：{summary}"
+                ),
+                evidence="Hermes completion notification: exit 0 with reply",
+                exit_code=0,
+            )
+        else:
+            state.transition_task(
+                task.id,
+                status="waiting",
+                progress=(
+                    "背景 runner 回報 exit 0，但沒有 OT final hook 或可辨識回覆；"
+                    "bridge 暫不宣稱任務完成。"
+                ),
+                evidence="Hermes completion notification: exit 0 without reply",
+                exit_code=0,
+            )
+        return True
+
+    state.transition_task(
+        task.id,
+        status="waiting",
+        progress=(
+            "Hermes 已送來背景 runner 完成通知，但沒有 exit code；"
+            "尚無足夠證據判定 OT 成功或失敗。"
+        ),
+        evidence="Hermes completion notification: exit code unavailable",
+    )
+    return True
 
 def _state() -> BridgeState:
     path = shared_state_path().resolve()
@@ -170,16 +409,25 @@ def _after_tool(
         if tool_name == "message_agent":
             payload = _parsed_result(result)
             process_id = str(payload.get("process_id") or "").strip()
-            if payload.get("status") == "sent" and process_id:
-                state.acknowledge_dispatch(
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    process_id=process_id,
-                )
+            delivery_status = str(payload.get("status") or "").strip().lower()
+            if delivery_status in {"sent", "queued"}:
+                if process_id:
+                    state.acknowledge_dispatch(
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        process_id=process_id,
+                        delivery_status=delivery_status,
+                    )
+                else:
+                    state.acknowledge_without_process(
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        delivery_status=delivery_status,
+                    )
                 return
             error = str(
                 payload.get("error") or error_message or
-                ("message_agent 未回傳可辨識的 sent acknowledgement" if status != "success" else "")
+                "message_agent 未回傳可辨識的 sent／queued acknowledgement"
             ).strip()
             if error:
                 state.fail_dispatch(
@@ -207,11 +455,16 @@ def _before_llm(
     turn_id: str = "",
     **_: Any,
 ) -> dict[str, str] | None:
-    task_id = extract_task_id(user_message)
-    if not task_id:
-        return None
     try:
         state = _state()
+        # message_agent 的 notify_on_complete 會以合成 user turn 回到派工者。
+        # 先依 process ID 收斂狀態，且不要把通知 output 中可能出現的 task
+        # marker 誤綁成 Controller 自己的 worker turn。
+        if _observe_process_completion(state, user_message):
+            return None
+        task_id = extract_task_id(user_message)
+        if not task_id:
+            return None
         task = state.task(task_id)
         if task is None:
             return None
@@ -370,6 +623,9 @@ def bridge_task_status(args: dict[str, Any], **_: Any) -> str:
             "evidence": task.evidence,
             "process_id": task.process_id,
             "exit_code": task.exit_code,
+            "worker_started": task.worker_started,
+            "final_observed": task.final_observed,
+            "worker_profile": task.worker_profile,
             "pending_notes": task.pending_notes,
             "updated_at": task.updated_at,
         }

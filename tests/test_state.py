@@ -246,6 +246,36 @@ class BridgeStateTests(unittest.TestCase):
         # 第一則仍在 retry 時，同一任務的第二則不得越過它。
         self.assertEqual(self.state.claim_due_outbox(), [])
 
+    def test_legacy_finished_snapshot_migrates_to_unconfirmed(self) -> None:
+        task, _created = self.state.create_task(
+            chat_id="10",
+            origin_profile="default",
+            origin_session_id="controller-session",
+            origin_turn_id="controller-turn",
+            origin_tool_call_id="legacy-finished-call",
+            target="worker",
+        )
+        connection = sqlite3.connect(self.state.path)
+        try:
+            connection.execute(
+                "UPDATE bridge_tasks SET status = 'finished' WHERE task_id = ?",
+                (task.id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reopened = BridgeState(self.state.path)
+        self.assertEqual(reopened.task(task.id).status, "unconfirmed")
+        recovered = reopened.bind_worker(
+            task.id,
+            worker_profile="worker",
+            worker_session_id="late-worker-session",
+            worker_turn_id="late-worker-turn",
+        )
+        self.assertEqual(recovered.status, "running")
+        self.assertIsNone(recovered.finished_at)
+
     def test_startup_reconciles_unread_notes_left_on_closed_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "closed-notes.sqlite3"
