@@ -419,6 +419,37 @@ class BridgeState:
         with self._read_connection() as connection:
             return self._task_locked(connection, task_id)
 
+    def latest_explicit_progress(self, task_id: str) -> str:
+        """回傳 OT 最近一次明確回報，供自動 lifecycle transition 保留。"""
+
+        normalized = normalize_task_id(task_id)
+        if not normalized:
+            return ""
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT progress FROM bridge_task_events "
+                "WHERE task_id = ? AND evidence IN "
+                "('OT explicit bridge_task_update', 'OT explicit bridge_task_result') "
+                "ORDER BY id DESC LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        return str(row["progress"]) if row else ""
+
+    def latest_explicit_result(self, task_id: str) -> str:
+        """回傳 OT 以 ``status=result`` 標示的最終公開里程碑。"""
+
+        normalized = normalize_task_id(task_id)
+        if not normalized:
+            return ""
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT progress FROM bridge_task_events "
+                "WHERE task_id = ? AND evidence = 'OT explicit bridge_task_result' "
+                "ORDER BY id DESC LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        return str(row["progress"]) if row else ""
+
     def find_task_by_origin_call(self, session_id: str, tool_call_id: str) -> TaskRecord | None:
         if not session_id or not tool_call_id:
             return None
@@ -700,20 +731,23 @@ class BridgeState:
                     return self.transition_task(
                         task.id,
                         status="completed",
-                        progress="OT 已產生最終回覆，且背景程序已結束。",
+                        progress=task.progress or "OT 已產生最終回覆，且背景程序已結束。",
                         evidence="post_llm_call + agents.list: exited",
                     )
                 return self.transition_task(
                     task.id,
                     status="finished",
-                    progress="背景程序已結束，但全域 telemetry 不提供 exit code；請以 Controller 回覆確認結果。",
+                    progress="背景程序已結束，但沒有 final hook 或 exit code，bridge 無法判定結果。",
                     evidence="agents.list: exited (exit code unavailable)",
                 )
             if int(exit_code) == 0:
                 return self.transition_task(
                     task.id,
                     status="completed",
-                    progress="OT turn 的背景程序已成功結束；實際結果會由 Controller 回覆。",
+                    progress=(
+                        task.progress
+                        or "OT turn 的背景程序已成功結束，但沒有可顯示的結果摘要。"
+                    ),
                     evidence="process telemetry: exited (exit 0)",
                     exit_code=0,
                 )
@@ -727,15 +761,42 @@ class BridgeState:
             )
         return task
 
-    def complete_worker_turn(self, session_id: str, turn_id: str = "") -> TaskRecord | None:
+    def complete_worker_turn(
+        self,
+        session_id: str,
+        turn_id: str = "",
+        *,
+        assistant_response: str = "",
+    ) -> TaskRecord | None:
+        """記錄 OT 已產生最終答覆，並保留最有價值的公開結果。
+
+        明確的 ``bridge_task_update`` 永遠優先；只有 OT 漏掉明確回報時，
+        才保存 ``post_llm_call`` 提供、經單行清理的 final assistant response。
+        """
+
         task = self.task_for_worker(session_id, turn_id)
         if task is None:
             return None
+        explicit_result = self.latest_explicit_result(task.id)
+        explicit_progress = self.latest_explicit_progress(task.id)
+        final_summary = ""
+        if isinstance(assistant_response, str):
+            final_summary = sanitize_progress(assistant_response, limit=1000)
         return self.transition_task(
             task.id,
             status="returning",
-            progress="OT 已產生最終回覆，背景程序正在把結果送回 Controller。",
-            evidence="hook:post_llm_call",
+            progress=(
+                explicit_result
+                or (f"OT 最終回覆：{final_summary}" if final_summary else "")
+                or explicit_progress
+                or task.progress
+                or "OT 已產生最終回覆，但 hook 未提供可顯示文字；等待背景程序結束。"
+            ),
+            evidence=(
+                "hook:post_llm_call (sanitized final fallback)"
+                if final_summary and not explicit_result
+                else "hook:post_llm_call"
+            ),
         )
 
     def list_tasks(self, *, chat_id: str | None = None, limit: int = 10) -> list[TaskRecord]:

@@ -1,7 +1,8 @@
 """可追蹤 ``message_agent`` 任務的領域模型與 Telegram 呈現。
 
-這裡只保存可安全顯示的狀態摘要；原始 prompt、工具參數與工具結果不會寫入
-任務卡，避免把 Controller／OT 的私密內容意外轉送到 Telegram。
+這裡只保存可安全顯示的狀態摘要，以及追蹤任務的清理後 OT 最終答覆摘要；
+原始 prompt、conversation history、工具參數與工具結果不會寫入任務卡，
+避免把 Controller／OT 的私密內容意外轉送到 Telegram。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ TASK_STATUS_LABELS = {
     "running": "OT 處理中",
     "waiting": "等待留言／外部條件",
     "blocked": "需要協助",
-    "returning": "OT 已產生回覆，正在回傳",
+    "returning": "OT 已產生回覆",
     "completed": "已完成",
     "finished": "背景程序已結束（結果待確認）",
     "failed": "失敗",

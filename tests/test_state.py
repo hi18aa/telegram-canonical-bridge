@@ -108,6 +108,12 @@ class BridgeStateTests(unittest.TestCase):
             worker_turn_id="worker-turn",
         )
         self.assertEqual(worker.status, "running")
+        self.state.transition_task(
+            task.id,
+            status="running",
+            progress="OT 已回報一般進度，但這不是最終結果。",
+            evidence="OT explicit bridge_task_update",
+        )
         # 兩個快速 revision 應合併成一筆待 edit outbox。
         edits = self.state.claim_due_outbox()
         self.assertEqual(len(edits), 1)
@@ -132,8 +138,14 @@ class BridgeStateTests(unittest.TestCase):
         inbox_task, notes = self.state.read_task_notes(task.id, mark_read=True)
         self.assertEqual([note.text for note in notes], ["請先確認登入狀態"])
         self.assertEqual(inbox_task.pending_notes, 0)
-        returning = self.state.complete_worker_turn("worker-session", "worker-turn")
+        returning = self.state.complete_worker_turn(
+            "worker-session",
+            "worker-turn",
+            assistant_response=f"已完成\n[TCB-TASK:{task.id}] 的公開結果。",
+        )
         self.assertEqual(returning.status, "returning")
+        self.assertEqual(returning.progress, "OT 最終回覆：已完成 [task] 的公開結果。")
+        self.assertEqual(returning.evidence, "hook:post_llm_call (sanitized final fallback)")
         _returning, accepted, detail = self.state.add_task_note(
             task_id=task.id,
             chat_id="10",
@@ -148,6 +160,7 @@ class BridgeStateTests(unittest.TestCase):
         )
         self.assertEqual(completed.status, "completed")
         self.assertEqual(completed.exit_code, 0)
+        self.assertEqual(completed.progress, returning.progress)
 
         terminal, accepted, detail = self.state.add_task_note(
             task_id=task.id,

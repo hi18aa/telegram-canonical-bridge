@@ -69,13 +69,22 @@ class TaskFeatureTests(unittest.TestCase):
                 update = json.loads(bridge_task_update(
                     {
                         "task_id": task_id,
-                        "status": "working",
+                        "status": "result",
                         "message": "瀏覽器已透過工具成功開啟，正在檢查頁面。",
                     },
                     session_id="worker-session",
                 ))
                 self.assertTrue(update["ok"])
                 self.assertIn("瀏覽器", state.task(task_id).progress)
+
+                _before_tool(
+                    "terminal",
+                    {"command": "close browser"},
+                    session_id="worker-session",
+                    tool_call_id="tool-after-explicit-update",
+                    turn_id="worker-turn",
+                )
+                self.assertIn("成功開啟", state.task(task_id).progress)
 
                 state.add_task_note(
                     task_id=task_id,
@@ -94,8 +103,14 @@ class TaskFeatureTests(unittest.TestCase):
                 )
                 self.assertEqual(state.task(task_id).pending_notes, 0)
 
-                _after_llm(session_id="worker-session", turn_id="worker-turn")
+                _after_llm(
+                    session_id="worker-session",
+                    turn_id="worker-turn",
+                    assistant_response="這段 fallback 不應覆寫 OT 的明確里程碑。",
+                )
                 self.assertEqual(state.task(task_id).status, "returning")
+                self.assertIn("成功開啟", state.task(task_id).progress)
+                self.assertNotIn("fallback", state.task(task_id).progress)
 
     def test_without_active_telegram_route_message_agent_is_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

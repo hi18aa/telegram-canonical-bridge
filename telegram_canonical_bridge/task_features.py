@@ -97,7 +97,14 @@ def _before_tool(
                 return None
             task = state.task_for_worker(session_id, turn_id)
             activity = _tool_activity(tool_name)
-            if task is not None and not task.terminal and activity is not None:
+            if (
+                task is not None
+                and not task.terminal
+                and activity is not None
+                and not state.latest_explicit_progress(task.id)
+            ):
+                # OT 的明確、使用者可見里程碑比後續泛用 tool category 更有資訊；
+                # 例如回報頁面標題後關閉 browser 所用的 terminal 不應抹掉結果。
                 state.transition_task(
                     task.id, status="running", progress=activity[0], evidence=activity[1]
                 )
@@ -223,8 +230,11 @@ def _before_llm(
                 "開始時、長時間操作前後、以及送出最終答覆前，呼叫 "
                 f"bridge_task_inbox(task_id=\"{task_id}\") 檢查使用者留言。"
                 "若要宣稱瀏覽器或其他介面已開啟，必須先有相應工具成功的證據。"
-                "完成工作後照常回覆 Controller；bridge 會由 post_llm_call 與背景程序 "
-                "exit code 判定完成，不需自行宣稱 completed。"
+                "完成工作後，先用 bridge_task_update(status=\"result\") 回報一則簡潔、"
+                "可公開的最終里程碑，"
+                "再照常回覆 Controller；bridge 會由 post_llm_call 與背景程序狀態判定完成，"
+                "不需自行宣稱 completed。若漏掉明確里程碑，bridge 只會把清理後的最終答覆"
+                "摘要留在 Telegram 任務卡，不會保存內部思考或原始工具資料。"
             )
         }
     except Exception:
@@ -232,9 +242,18 @@ def _before_llm(
         return None
 
 
-def _after_llm(session_id: str, turn_id: str = "", **_: Any) -> None:
+def _after_llm(
+    session_id: str,
+    turn_id: str = "",
+    assistant_response: str = "",
+    **_: Any,
+) -> None:
     try:
-        _state().complete_worker_turn(session_id, turn_id)
+        _state().complete_worker_turn(
+            session_id,
+            turn_id,
+            assistant_response=assistant_response,
+        )
     except Exception:
         logger.warning("Telegram canonical bridge post_llm_call observer failed", exc_info=True)
 
@@ -294,7 +313,12 @@ def bridge_task_update(args: dict[str, Any], **kwargs: Any) -> str:
     if error:
         return _json({"ok": False, "error": error})
     requested = str(args.get("status") or "working").strip().lower()
-    mapped = {"working": "running", "waiting": "waiting", "blocked": "blocked"}.get(requested)
+    mapped = {
+        "working": "running",
+        "waiting": "waiting",
+        "blocked": "blocked",
+        "result": "running",
+    }.get(requested)
     message = sanitize_progress(args.get("message"))
     if mapped is None or not message:
         return _json({"ok": False, "error": "status 或 message 無效。"})
@@ -302,7 +326,11 @@ def bridge_task_update(args: dict[str, Any], **kwargs: Any) -> str:
         task.id,
         status=mapped,
         progress=message,
-        evidence="OT explicit bridge_task_update",
+        evidence=(
+            "OT explicit bridge_task_result"
+            if requested == "result"
+            else "OT explicit bridge_task_update"
+        ),
     )
     return _json({
         "ok": updated is not None,
@@ -368,7 +396,7 @@ def register_task_features(ctx: Any) -> None:
                     "task_id": {"type": "string", "description": "TCB task ID from injected context."},
                     "status": {
                         "type": "string",
-                        "enum": ["working", "waiting", "blocked"],
+                        "enum": ["working", "waiting", "blocked", "result"],
                         "description": "Evidence-based current state.",
                     },
                     "message": {
