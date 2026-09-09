@@ -26,7 +26,8 @@ V2 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調：
 | OT 處理中 | OT turn 開始、背景程序為 running，或觀察到工具呼叫 | 特定 UI 已成功開啟 |
 | 明確進度 | OT 呼叫 `bridge_task_update` 回報可驗證里程碑 | OT 的內部思考或逐 token 串流 |
 | 正在回傳 | OT 已產生最終答覆 | Controller 已把答案送到 Telegram |
-| 已完成 | 背景程序以 exit code 0 結束 | 每個外部系統都一定成功 |
+| 已完成 | OT 已產生最終答覆且程序已結束，或 telemetry 明確取得 exit code 0 | 每個外部系統都一定成功 |
+| 結果待確認 | 程序已結束，但全域摘要沒有 exit code／final hook | 工作成功或失敗 |
 
 這不是遠端桌面監看，也不會公開 chain-of-thought。若 OT 要說「頁面已開啟」，仍必須先有相應工具成功的結果。狀態卡提供的是可驗證的生命週期，不是假裝能看見 agent 的每一步。
 
@@ -236,7 +237,7 @@ SQLite ledger 不會因停用 plugin 自動刪除。確認不再需要歷史與�
 - 一個 Controller profile 只綁定一個 Telegram 私訊 route。
 - `/tell` 不會中斷正在執行的工具；讀取速度取決於 OT 是否到達 inbox 檢查點。
 - Hermes 的事件 replay 是有界 buffer；重啟或長時間中斷後可能缺少中間狀態，但 final history 與 process 狀態仍可恢復主要結果。
-- `completed` 是背景程序成功結束的證據，不是對任務內容正確性的保證。
+- `completed` 是 final hook 加程序結束，或 exit code 0 的證據，不是對任務內容正確性的保證；缺少足夠證據時會顯示「結果待確認」。
 
 更完整的資料模型、相容性策略與故障行為見 [`docs/實作設計與驗收.md`](docs/實作設計與驗收.md)。
 

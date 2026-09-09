@@ -22,7 +22,6 @@ class FakeBackend:
         self.events: list[dict[str, Any]] = []
         self.latest_seq = 0
         self.processes: list[dict[str, Any]] = []
-        self.processes_by_session: dict[str, list[dict[str, Any]]] = {}
 
 
 class FakeRpc:
@@ -60,12 +59,8 @@ class FakeRpc:
                 "count": len(self.backend.events),
                 "epoch": "fake-epoch",
             }
-        if method == "process.list":
-            return {
-                "processes": self.backend.processes_by_session.get(
-                    str(data.get("session_id") or ""), self.backend.processes
-                )
-            }
+        if method == "agents.list":
+            return {"processes": self.backend.processes}
         raise AssertionError(f"unexpected RPC method: {method}")
 
 
@@ -120,7 +115,7 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_replay_ack_and_process_list_update_task_without_resuming_session(self) -> None:
+    def test_replay_ack_and_global_process_list_update_task_without_resuming_session(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 config = BridgeConfig(
@@ -182,17 +177,23 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 self.assertEqual(running.status, "running")
                 self.assertNotIn("session.resume", [method for method, _ in backend.calls])
 
+                state.bind_worker(
+                    task.id,
+                    worker_profile="operitrace-agent",
+                    worker_session_id="worker-session",
+                    worker_turn_id="worker-turn",
+                )
+                state.complete_worker_turn("worker-session", "worker-turn")
                 backend.events = []
                 backend.latest_seq = 2
                 backend.processes[0] = {
                     "session_id": "process-1",
                     "status": "exited",
-                    "exit_code": 0,
                 }
                 self.assertEqual(await service.sync_task_telemetry(), 1)
                 completed = state.task(task.id)
                 self.assertEqual(completed.status, "completed")
-                self.assertEqual(completed.exit_code, 0)
+                self.assertIsNone(completed.exit_code)
 
         asyncio.run(scenario())
 
@@ -222,7 +223,7 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_process_polling_uses_nested_task_origin_session(self) -> None:
+    def test_global_process_polling_covers_nested_task_origin_session(self) -> None:
         async def scenario() -> None:
             with tempfile.TemporaryDirectory() as directory:
                 config = BridgeConfig(
@@ -253,10 +254,9 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                     tool_call_id="nested-tool",
                     process_id="nested-process",
                 )
-                backend.processes_by_session["worker-canonical-session"] = [{
+                backend.processes = [{
                     "session_id": "nested-process",
                     "status": "exited",
-                    "exit_code": 0,
                 }]
                 service = CanonicalBridgeService(
                     config,
@@ -265,12 +265,8 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 )
 
                 self.assertEqual(await service.sync_task_telemetry(), 1)
-                self.assertEqual(state.task(nested.id).status, "completed")
-                process_calls = [
-                    params["session_id"]
-                    for method, params in backend.calls if method == "process.list"
-                ]
-                self.assertIn("worker-canonical-session", process_calls)
+                self.assertEqual(state.task(nested.id).status, "finished")
+                self.assertIn("agents.list", [method for method, _params in backend.calls])
 
         asyncio.run(scenario())
 

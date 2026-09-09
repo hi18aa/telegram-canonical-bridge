@@ -178,7 +178,7 @@ class CanonicalBridgeService:
                 return queued
 
     async def sync_task_telemetry(self) -> int:
-        """唯讀補抓 message_agent ack 與背景程序狀態，不呼叫 session.resume。"""
+        """唯讀補抓 message_agent ack 與全域背景程序狀態，不呼叫 session.resume。"""
 
         handle = self._known_canonical()
         if handle is None:
@@ -186,8 +186,14 @@ class CanonicalBridgeService:
         changed = 0
         async with self._operation_lock:
             async with self._new_rpc() as rpc:
-                changed += await self._sync_event_replay(rpc, handle)
-                changed += await self._sync_processes(rpc, handle)
+                try:
+                    changed += await self._sync_event_replay(rpc, handle)
+                except RpcError as exc:
+                    logger.debug("Telegram canonical bridge event replay unavailable: %s", exc)
+                try:
+                    changed += await self._sync_processes(rpc)
+                except RpcError as exc:
+                    logger.debug("Telegram canonical bridge process telemetry unavailable: %s", exc)
         return changed
 
     async def _sync_event_replay(self, rpc: HermesRpcClient, handle: CanonicalHandle) -> int:
@@ -263,40 +269,39 @@ class CanonicalBridgeService:
             self.state.set_meta(f"event-replay-truncated:{handle.root_id}", str(latest_seq or 0))
         return changed
 
-    async def _sync_processes(self, rpc: HermesRpcClient, handle: CanonicalHandle) -> int:
+    async def _sync_processes(self, rpc: HermesRpcClient) -> int:
         tasks = self.state.tasks_requiring_process_poll()
-        by_origin: dict[str, list[Any]] = {}
-        for task in tasks:
-            origin_session_id = task.origin_session_id or handle.runtime_id
-            by_origin.setdefault(origin_session_id, []).append(task)
-
+        if not tasks:
+            return 0
+        # process.list 是 live-session scoped；短生命週期 watcher 在 runtime detach
+        # 後直接呼叫會得到 4001。agents.list 是唯讀全域摘要，足以依已知
+        # opaque process handle 判斷 running/exited，且不需要 resume 或接管 session。
+        response = await rpc.call("agents.list", {})
+        rows = response.get("processes") if isinstance(response, dict) else None
+        processes = {
+            str(row.get("session_id") or ""): row
+            for row in rows if isinstance(row, dict) and row.get("session_id")
+        } if isinstance(rows, list) else {}
         changed = 0
-        for origin_session_id, origin_tasks in by_origin.items():
-            response = await rpc.call("process.list", {"session_id": origin_session_id})
-            rows = response.get("processes") if isinstance(response, dict) else None
-            processes = {
-                str(row.get("session_id") or ""): row
-                for row in rows if isinstance(row, dict) and row.get("session_id")
-            } if isinstance(rows, list) else {}
-            for task in origin_tasks:
-                if not task.process_id:
-                    continue
-                row = processes.get(task.process_id)
-                if row is None:
-                    continue
-                raw_exit = row.get("exit_code")
-                try:
-                    exit_code = int(raw_exit) if raw_exit is not None else None
-                except (TypeError, ValueError):
-                    exit_code = None
-                before = (task.status, task.progress, task.exit_code)
-                updated = self.state.observe_process(
-                    task.id,
-                    process_status=str(row.get("status") or ""),
-                    exit_code=exit_code,
-                )
-                if updated and (updated.status, updated.progress, updated.exit_code) != before:
-                    changed += 1
+        for task in tasks:
+            if not task.process_id:
+                continue
+            row = processes.get(task.process_id)
+            if row is None:
+                continue
+            raw_exit = row.get("exit_code")
+            try:
+                exit_code = int(raw_exit) if raw_exit is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+            before = (task.status, task.progress, task.exit_code)
+            updated = self.state.observe_process(
+                task.id,
+                process_status=str(row.get("status") or ""),
+                exit_code=exit_code,
+            )
+            if updated and (updated.status, updated.progress, updated.exit_code) != before:
+                changed += 1
         return changed
 
     async def _submit_record(self, record: InboundRecord) -> None:

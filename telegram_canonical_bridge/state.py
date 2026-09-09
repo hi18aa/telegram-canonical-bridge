@@ -692,22 +692,36 @@ class BridgeState:
                 task.id,
                 status="running",
                 progress="Hermes 背景派工程序仍在執行；這不代表特定 UI 已開啟。",
-                evidence="process.list: running",
+                evidence="agents.list: running",
             )
-        if normalized_status == "exited" and exit_code is not None:
+        if normalized_status == "exited":
+            if exit_code is None:
+                if task.status == "returning":
+                    return self.transition_task(
+                        task.id,
+                        status="completed",
+                        progress="OT 已產生最終回覆，且背景程序已結束。",
+                        evidence="post_llm_call + agents.list: exited",
+                    )
+                return self.transition_task(
+                    task.id,
+                    status="finished",
+                    progress="背景程序已結束，但全域 telemetry 不提供 exit code；請以 Controller 回覆確認結果。",
+                    evidence="agents.list: exited (exit code unavailable)",
+                )
             if int(exit_code) == 0:
                 return self.transition_task(
                     task.id,
                     status="completed",
                     progress="OT turn 的背景程序已成功結束；實際結果會由 Controller 回覆。",
-                    evidence="process.list: exited (exit 0)",
+                    evidence="process telemetry: exited (exit 0)",
                     exit_code=0,
                 )
             return self.transition_task(
                 task.id,
                 status="failed",
                 progress="OT turn 的背景程序以非零 exit code 結束。",
-                evidence="process.list: exited",
+                evidence="process telemetry: exited",
                 exit_code=int(exit_code),
                 last_error=f"background process exit code {int(exit_code)}",
             )

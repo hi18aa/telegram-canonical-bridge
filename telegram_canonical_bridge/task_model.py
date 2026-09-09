@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 TASK_ID_RE = re.compile(r"^TCB-[0-9]{8}-[A-F0-9]{6}$", re.IGNORECASE)
 TASK_MARKER_RE = re.compile(r"\[TCB-TASK:(TCB-[0-9]{8}-[A-F0-9]{6})\]", re.IGNORECASE)
 
-TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_TASK_STATUSES = frozenset({"completed", "finished", "failed", "cancelled"})
 
 TASK_STATUS_LABELS = {
     "dispatching": "準備派工",
@@ -25,6 +25,7 @@ TASK_STATUS_LABELS = {
     "blocked": "需要協助",
     "returning": "OT 已產生回覆，正在回傳",
     "completed": "已完成",
+    "finished": "背景程序已結束（結果待確認）",
     "failed": "失敗",
     "cancelled": "已取消",
 }
