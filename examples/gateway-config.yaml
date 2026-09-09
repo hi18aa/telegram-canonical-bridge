@@ -1,0 +1,27 @@
+# 將此段合併至 <HERMES_HOME>/config.yaml。
+# token 一律放在 <HERMES_HOME>/.env，不要放入 config.yaml。
+plugins:
+  enabled:
+    - telegram-canonical-bridge
+
+gateway:
+  platforms:
+    telegram_canonical_bridge:
+      enabled: true
+      extra:
+        # Hermes serve 的 WebSocket endpoint。
+        backend_url: ws://127.0.0.1:9119/api/ws
+        # 這個 profile 必須已有未隱藏、未封存且標題精確為 Bot Chat 的 canonical session。
+        controller_profile: default
+        # 預設拒絕所有人；僅列出可操作此 Controller 的 Telegram user ID。
+        allowed_user_ids:
+          - "123456789"
+        # 選填：再收斂為一個私訊 chat。通常私訊 chat ID 與 user ID 相同。
+        # home_chat_id: "123456789"
+        # 選填：省略時使用 <HERMES_HOME>/plugin-data/telegram-canonical-bridge/bridge.sqlite3。
+        # state_path: C:\\secure-data\\telegram-canonical-bridge.sqlite3
+        telegram_poll_timeout_seconds: 40
+        history_poll_interval_seconds: 3
+        rpc_timeout_seconds: 25
+        retry_base_seconds: 2
+        retry_max_seconds: 60

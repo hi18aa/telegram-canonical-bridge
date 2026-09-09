@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-canonical-bridge"
+version = "0.1.0"
+description = "將 Telegram 私訊橋接至 Hermes canonical Bot Chat 的平台外掛"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.setuptools]
+packages = ["telegram_canonical_bridge"]
+
+[tool.unittest]
+start-directory = "tests"
