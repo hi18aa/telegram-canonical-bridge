@@ -1,10 +1,14 @@
 name: telegram-canonical-bridge
 label: Telegram Canonical Bridge
 kind: platform
-version: 0.4.0
-description: 將 Telegram 私訊轉送至指定 Hermes Controller 的 canonical Bot Chat，並追蹤 message_agent 任務。
+version: 0.5.0
+description: 保留 Hermes 原生 Telegram，為一般主 Agent session 提供可追蹤的 canonical Bot 派工 sidecar。
 author: hi18aa
 provides_tools:
+  - agent_task_start
+  - agent_task_status
+  - agent_task_message
+  - agent_task_cancel
   - bridge_task_update
   - bridge_task_inbox
   - bridge_task_status

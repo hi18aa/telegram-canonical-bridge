@@ -53,6 +53,23 @@ def _hermes_home() -> Path:
         return Path.home() / ".hermes"
 
 
+def hermes_machine_root() -> Path:
+    """取得所有本機 profiles 共用的 Hermes 根目錄。"""
+
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root())
+    except Exception:
+        home = _hermes_home()
+        try:
+            from tools.bot_mode_probe import _hermes_root
+
+            return Path(_hermes_root(home))
+        except Exception:
+            return home.parent.parent if home.parent.name == "profiles" else home
+
+
 def shared_state_path() -> Path:
     """回傳 Controller 與本機各 profile 都能開啟的共用 ledger 路徑。
 
@@ -64,19 +81,7 @@ def shared_state_path() -> Path:
     configured = os.getenv(STATE_PATH_ENV, "").strip()
     if configured:
         return Path(configured).expanduser()
-    try:
-        from hermes_constants import get_default_hermes_root
-
-        root = Path(get_default_hermes_root())
-    except Exception:
-        home = _hermes_home()
-        try:
-            from tools.bot_mode_probe import _hermes_root
-
-            root = Path(_hermes_root(home))
-        except Exception:
-            root = home.parent.parent if home.parent.name == "profiles" else home
-    return root / "plugin-data" / PLUGIN_STATE_DIRECTORY / "bridge.sqlite3"
+    return hermes_machine_root() / "plugin-data" / PLUGIN_STATE_DIRECTORY / "bridge.sqlite3"
 
 
 def _string_list(value: Any, *, field: str) -> tuple[str, ...]:

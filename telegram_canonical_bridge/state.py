@@ -28,7 +28,10 @@ from .task_model import (
 
 
 AUTOMATIC_TASK_EVENT_MIN_INTERVAL_SECONDS = 15.0
-ACTIVE_TYPING_TASK_STATUSES = ("dispatching", "dispatched", "running", "returning")
+ACTIVE_TYPING_TASK_STATUSES = (
+    "dispatching", "dispatched", "running", "returning", "stopping"
+)
+NATIVE_OUTBOX_PREFIX = "native:"
 
 
 @dataclass(frozen=True)
@@ -365,7 +368,8 @@ class BridgeState:
                 "(status = 'submitted' AND response_pending = 1 "
                 "AND submitted_at >= ?)) "
                 "UNION SELECT chat_id FROM bridge_tasks "
-                f"WHERE status IN ({placeholders}) ORDER BY chat_id",
+                f"WHERE status IN ({placeholders}) "
+                "AND chat_id NOT LIKE 'native:%' ORDER BY chat_id",
                 (now, cutoff, *ACTIVE_TYPING_TASK_STATUSES),
             ).fetchall()
         return [str(row["chat_id"]) for row in rows]
@@ -523,6 +527,9 @@ class BridgeState:
         origin_tool_call_id: str,
         target: str,
         parent_task_id: str | None = None,
+        initial_progress: str = "Controller 正在呼叫原生 message_agent。",
+        initial_evidence: str = "hook:pre_tool_call",
+        queue_outbox: bool = True,
     ) -> tuple[TaskRecord, bool]:
         """建立派工 intent；同一 Hermes tool call 重入時回傳既有任務。"""
 
@@ -556,8 +563,8 @@ class BridgeState:
                         (
                             task_id, chat_id, origin_profile or "default", origin_session_id,
                             origin_turn_id, origin_tool_call_id, normalized_parent or None,
-                            clean_target, "Controller 正在呼叫原生 message_agent。",
-                            "hook:pre_tool_call", now, now,
+                            clean_target, sanitize_progress(initial_progress),
+                            sanitize_progress(initial_evidence, limit=180), now, now,
                         ),
                     )
                     break
@@ -576,7 +583,8 @@ class BridgeState:
             task = self._task_locked(connection, task_id)
             assert task is not None
             self._record_task_event_locked(connection, task)
-            self._queue_task_event_locked(connection, task)
+            if queue_outbox:
+                self._queue_task_event_locked(connection, task)
             return task, True
 
     @staticmethod
@@ -1122,6 +1130,29 @@ class BridgeState:
             self._queue_task_event_locked(connection, updated)
             return updated, True, "留言已保存；OT 會在下一個 task inbox 檢查點讀取。"
 
+    def add_agent_task_note(
+        self,
+        *,
+        task_id: str,
+        origin_profile: str,
+        text: str,
+        note_id: str,
+    ) -> tuple[TaskRecord | None, bool, str]:
+        """從主 Agent 保存補充指示，不假裝它是 Telegram 原始訊息。"""
+
+        task = self.task(task_id)
+        if task is None:
+            return None, False, "找不到這個任務。"
+        if task.origin_profile != str(origin_profile or "default"):
+            return task, False, "只有建立任務的主 Agent profile 可以補充指示。"
+        return self.add_task_note(
+            task_id=task.id,
+            chat_id=task.chat_id,
+            user_id=f"agent:{task.origin_profile}",
+            telegram_message_id=f"agent:{note_id}",
+            text=text,
+        )
+
     def read_task_notes(
         self, task_id: str, *, mark_read: bool = True, limit: int = 20
     ) -> tuple[TaskRecord | None, list[TaskNote]]:
@@ -1257,15 +1288,27 @@ class BridgeState:
             ).rowcount
         return bool(inserted)
 
-    def claim_due_outbox(self, *, limit: int = 8, lease_seconds: float = 60) -> list[OutboxRecord]:
+    def _claim_due_outbox(
+        self,
+        *,
+        native: bool,
+        limit: int = 8,
+        lease_seconds: float = 60,
+    ) -> list[OutboxRecord]:
         now = time.time()
         claimed: list[OutboxRecord] = []
+        route_clause = (
+            "AND o.chat_id LIKE 'native:%' "
+            if native
+            else "AND o.chat_id NOT LIKE 'native:%' "
+        )
         with self._transaction() as connection:
             rows = connection.execute(
                 "SELECT o.id, o.chat_id, o.content, o.attempts, o.kind, o.task_id, "
                 "o.reply_to_message_id, o.silent FROM outbox o "
                 "WHERE ((o.status IN ('pending', 'retry') AND o.next_attempt_at <= ?) "
                 "OR (o.status = 'sending' AND o.lease_until < ?)) "
+                + route_clause +
                 "AND (o.task_id IS NULL OR NOT EXISTS ("
                 "SELECT 1 FROM outbox prior WHERE prior.task_id = o.task_id "
                 "AND prior.id < o.id AND prior.status <> 'sent')) "
@@ -1287,6 +1330,24 @@ class BridgeState:
                     silent=bool(row["silent"]),
                 ))
         return claimed
+
+    def claim_due_outbox(
+        self, *, limit: int = 8, lease_seconds: float = 60
+    ) -> list[OutboxRecord]:
+        """取得舊版自管 Telegram adapter 的待送訊息。"""
+
+        return self._claim_due_outbox(
+            native=False, limit=limit, lease_seconds=lease_seconds
+        )
+
+    def claim_due_native_outbox(
+        self, *, limit: int = 8, lease_seconds: float = 60
+    ) -> list[OutboxRecord]:
+        """取得交由 ``hermes send`` 發送的新 sidecar 時間線訊息。"""
+
+        return self._claim_due_outbox(
+            native=True, limit=limit, lease_seconds=lease_seconds
+        )
 
     def mark_outbox_sent(self, record_id: int, telegram_message_id: str) -> None:
         with self._transaction() as connection:

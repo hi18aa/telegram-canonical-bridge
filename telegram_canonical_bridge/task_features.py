@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start, system_prompt_section
 from .config import shared_state_path
+from .native_delivery import flush_native_outbox
 from .state import BridgeState
 from .task_model import extract_task_id, sanitize_progress, task_marker
 
@@ -26,10 +28,18 @@ BRIDGE_TOOL_NAMES = frozenset({
     "bridge_task_update",
     "bridge_task_inbox",
     "bridge_task_status",
-})
+}) | AGENT_TASK_TOOL_NAMES
 MESSAGE_AGENT_MAX_CHARS = 16_000
 _STATE_CACHE: dict[Path, BridgeState] = {}
 _STATE_CACHE_LOCK = threading.Lock()
+
+
+def _transition_task(state: BridgeState, task_id: str, **changes: Any):
+    """更新 ledger 後，順手嘗試送出原生平台時間線；失敗仍留在 outbox。"""
+
+    updated = state.transition_task(task_id, **changes)
+    flush_native_outbox(state)
+    return updated
 
 
 @dataclass(frozen=True)
@@ -194,7 +204,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
 
     if completion.exit_code is not None and completion.exit_code != 0:
         if task.status == "returning":
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="completed",
                 evidence=(
@@ -205,7 +216,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
             )
             return True
         progress, detail = _completion_failure_message(completion)
-        state.transition_task(
+        _transition_task(
+            state,
             task.id,
             status="failed",
             progress=progress,
@@ -219,7 +231,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
         return True
 
     if completion.exit_code == 0 and _is_live_delivery_ack(completion.output):
-        state.transition_task(
+        _transition_task(
+            state,
             task.id,
             status="waiting",
             progress=(
@@ -234,7 +247,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
     if completion.exit_code == 0:
         summary = _completion_reply_summary(completion.output)
         if task.status == "returning" or summary:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="completed",
                 progress=(
@@ -246,7 +260,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
                 exit_code=0,
             )
         else:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="waiting",
                 progress=(
@@ -258,7 +273,8 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
             )
         return True
 
-    state.transition_task(
+    _transition_task(
+        state,
         task.id,
         status="waiting",
         progress=(
@@ -331,6 +347,15 @@ def _before_tool(
 
     try:
         state = _state()
+        if tool_name == "agent_task_start":
+            return prepare_start(
+                state,
+                args or {},
+                origin_profile=_current_profile(),
+                session_id=str(session_id or ""),
+                turn_id=str(turn_id or ""),
+                tool_call_id=str(tool_call_id or ""),
+            )
         if tool_name != "message_agent":
             if tool_name in BRIDGE_TOOL_NAMES:
                 return None
@@ -344,7 +369,8 @@ def _before_tool(
             ):
                 # OT 的明確、使用者可見里程碑比後續泛用 tool category 更有資訊；
                 # 例如回報頁面標題後關閉 browser 所用的 terminal 不應抹掉結果。
-                state.transition_task(
+                _transition_task(
+                    state,
                     task.id, status="running", progress=activity[0], evidence=activity[1]
                 )
             return None
@@ -375,14 +401,16 @@ def _before_tool(
         marker = task_marker(task.id)
         tracked_body = body if extract_task_id(body) == task.id else f"{marker}\n{body}"
         if len(tracked_body) > MESSAGE_AGENT_MAX_CHARS:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 progress="派工內容接近 message_agent 上限，未注入 OT 追蹤 marker；仍保留程序狀態。",
                 evidence="hook:marker-skipped-size",
             )
             return None
         if parent is not None and not parent.terminal:
-            state.transition_task(
+            _transition_task(
+                state,
                 parent.id,
                 status="running",
                 progress=f"OT 又透過 message_agent 派工給 @{target.lstrip('@')}。",
@@ -424,6 +452,7 @@ def _after_tool(
                         tool_call_id=tool_call_id,
                         delivery_status=delivery_status,
                     )
+                flush_native_outbox(state)
                 return
             error = str(
                 payload.get("error") or error_message or
@@ -433,13 +462,15 @@ def _after_tool(
                 state.fail_dispatch(
                     session_id=session_id, tool_call_id=tool_call_id, error=error
                 )
+                flush_native_outbox(state)
             return
 
         if tool_name in BRIDGE_TOOL_NAMES:
             return
         task = state.task_for_worker(session_id, turn_id)
         if task is not None and not task.terminal and status in {"error", "blocked"}:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="running",
                 progress=f"OT 的 {tool_name} 呼叫未成功；OT 仍可調整後繼續。",
@@ -464,7 +495,8 @@ def _before_llm(
             return None
         task_id = extract_task_id(user_message)
         if not task_id:
-            return None
+            context = system_prompt_section({"profile_name": _current_profile()})
+            return {"context": context} if context else None
         task = state.task(task_id)
         if task is None:
             return None
@@ -476,6 +508,7 @@ def _before_llm(
         )
         if bound is None:
             return None
+        flush_native_outbox(state)
         return {
             "context": (
                 f"這是 Telegram Canonical Bridge 追蹤任務 {task_id}。"
@@ -502,11 +535,13 @@ def _after_llm(
     **_: Any,
 ) -> None:
     try:
-        _state().complete_worker_turn(
+        state = _state()
+        state.complete_worker_turn(
             session_id,
             turn_id,
             assistant_response=assistant_response,
         )
+        flush_native_outbox(state)
     except Exception:
         logger.warning("Telegram canonical bridge post_llm_call observer failed", exc_info=True)
 
@@ -528,7 +563,8 @@ def _on_session_end(
             return
         reason = sanitize_progress(turn_exit_reason, limit=280)
         if failed:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="failed",
                 progress="OT turn 在產生最終回覆前失敗。",
@@ -536,7 +572,8 @@ def _on_session_end(
                 last_error=reason or "worker turn failed",
             )
         else:
-            state.transition_task(
+            _transition_task(
+                state,
                 task.id,
                 status="blocked",
                 progress="OT turn 被中斷；任務可能需要重新派送。",
@@ -575,7 +612,8 @@ def bridge_task_update(args: dict[str, Any], **kwargs: Any) -> str:
     message = sanitize_progress(args.get("message"))
     if mapped is None or not message:
         return _json({"ok": False, "error": "status 或 message 無效。"})
-    updated = state.transition_task(
+    updated = _transition_task(
+        state,
         task.id,
         status=mapped,
         progress=message,
@@ -601,6 +639,7 @@ def bridge_task_inbox(args: dict[str, Any], **kwargs: Any) -> str:
         return _json({"ok": False, "error": error})
     acknowledge = bool(args.get("acknowledge", True))
     updated, notes = state.read_task_notes(task.id, mark_read=acknowledge)
+    flush_native_outbox(state)
     return _json({
         "ok": True,
         "task_id": task.id,

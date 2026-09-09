@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telegram-canonical-bridge"
-version = "0.4.0"
-description = "將 Telegram 私訊橋接至 Hermes canonical Bot Chat 並追蹤 message_agent 任務的平台外掛"
+version = "0.5.0"
+description = "保留 Hermes 原生訊息平台並提供可追蹤的 canonical Bot 派工 sidecar"
 requires-python = ">=3.11"
 readme = "README.md"
 
