@@ -263,6 +263,12 @@ hermes gateway restart
 | Controller 暫時無法連線 | 確認 `hermes serve` 正在 `127.0.0.1:9119` 監聽，且兩個 backend token 完全相同。 |
 | 出現 `uncertain` 提示 | 先等候可能已在執行的回覆；若需要重試，請用新訊息重新提出需求，不要盲目重送同一筆工作。 |
 
+## 授權 / License
+
+本專案採用 [MIT License](LICENSE)。詳見 [LICENSE](LICENSE)。
+
+> **English:** This project is licensed under the MIT License.
+
 ## English summary
 
 Telegram Canonical Bridge is a native Hermes platform plugin, not a fork of Hermes core. It routes allowlisted Telegram DMs to a profile's canonical Bot Chat so the main agent can keep Bot Mode and `message_agent`.
