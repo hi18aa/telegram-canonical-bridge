@@ -39,7 +39,7 @@ V2 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調：
 - **Hermes 仍負責上下文壓縮。** 外掛不關閉或取代 Hermes 的 compaction；canonical runtime ID 改變時會重新解析 binding。
 - **任務 ledger 不跟著對話壓縮。** 任務狀態、留言及必要時清理後的 OT 最終答覆摘要會獨立存放於 SQLite；它不是完整聊天記憶，也不保存 OT 私密思考、conversation history 或原始工具資料。
 
-`/tell` 與回覆任務卡是**耐久留言**，不是即時中斷。OT 會在開始、自然里程碑與最終答覆前呼叫 `bridge_task_inbox`；若 OT 正卡在一個長時間、不可中斷的工具呼叫中，留言要等下一個檢查點才會被讀到。
+`/tell` 與回覆任務卡是**耐久留言**，不是即時中斷。OT 會在開始、自然里程碑與最終答覆前呼叫 `bridge_task_inbox`；若 OT 正卡在一個長時間、不可中斷的工具呼叫中，留言要等下一個檢查點才會被讀到。若留言在最後檢查點後才到達，bridge 會明確通知「未納入本次結果」、結清待讀數，並請使用者把需求另傳給 Controller，不會假裝已完成雙向傳遞。
 
 ## 架構
 
@@ -240,6 +240,7 @@ SQLite ledger 不會因停用 plugin 自動刪除。確認不再需要歷史與�
 - 目前只支援純文字 private chat；不支援群組、媒體或 token streaming。
 - 一個 Controller profile 只綁定一個 Telegram 私訊 route。
 - `/tell` 不會中斷正在執行的工具；讀取速度取決於 OT 是否到達 inbox 檢查點。
+- OT 產生 final 時仍未讀的留言會標為 `missed` 並另發警告；它們不會被偷偷套用到已結束的工作。
 - Hermes 原生背景完成通知是否喚醒 Controller，取決於當時是否仍有合適的 live session owner；bridge 不偽造這項保證，耐久結果面是 Telegram 任務卡。
 - Hermes 的事件 replay 是有界 buffer；重啟或長時間中斷後可能缺少中間狀態，但 SQLite 中的 final hook 結果與 process 狀態仍可恢復主要任務狀態。
 - `completed` 是 final hook 加程序結束，或 exit code 0 的證據，不是對任務內容正確性的保證；缺少足夠證據時會顯示「結果待確認」。

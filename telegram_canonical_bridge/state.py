@@ -54,6 +54,7 @@ class BridgeState:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self._reconcile_closed_task_notes()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15, isolation_level=None)
@@ -559,6 +560,81 @@ class BridgeState:
             (task.chat_id, dedup_key, content, task.id, time.time()),
         )
 
+    @staticmethod
+    def _mark_unread_notes_missed_locked(
+        connection: sqlite3.Connection, task_id: str, *, now: float
+    ) -> int:
+        """結束任務時封存 OT 未讀留言，避免完成卡持續顯示「待讀」。"""
+
+        row = connection.execute(
+            "SELECT COUNT(*) AS n FROM bridge_task_notes "
+            "WHERE task_id = ? AND status = 'unread'",
+            (task_id,),
+        ).fetchone()
+        count = int(row["n"]) if row else 0
+        if count:
+            connection.execute(
+                "UPDATE bridge_task_notes SET status = 'missed', read_at = ? "
+                "WHERE task_id = ? AND status = 'unread'",
+                (now, task_id),
+            )
+        return count
+
+    @staticmethod
+    def _queue_missed_notes_notice_locked(
+        connection: sqlite3.Connection, task: TaskRecord, count: int
+    ) -> None:
+        if count <= 0:
+            return
+        connection.execute(
+            "INSERT OR IGNORE INTO outbox(chat_id, dedup_key, content, kind, status, created_at) "
+            "VALUES (?, ?, ?, 'notice', 'pending', ?)",
+            (
+                task.chat_id,
+                f"task-notes-missed:{task.id}",
+                (
+                    f"⚠️ 任務 {task.id} 已產生最終回覆；OT 未及讀取 {count} 則任務留言，"
+                    "內容未納入本次結果。請把需求另傳成 Controller 的新訊息。"
+                ),
+                time.time(),
+            ),
+        )
+
+    def _reconcile_closed_task_notes(self) -> int:
+        """升級或重啟時結清舊版遺留在 closed task 的未讀留言。"""
+
+        closed_statuses = ("returning", *sorted(TERMINAL_TASK_STATUSES))
+        placeholders = ",".join("?" for _ in closed_statuses)
+        reconciled = 0
+        with self._transaction() as connection:
+            rows = connection.execute(
+                self._task_select()
+                + f"WHERE t.status IN ({placeholders}) AND EXISTS ("
+                "SELECT 1 FROM bridge_task_notes n "
+                "WHERE n.task_id = t.task_id AND n.status = 'unread')",
+                closed_statuses,
+            ).fetchall()
+            for row in rows:
+                task = self._task_from_row(row)
+                now = time.time()
+                missed = self._mark_unread_notes_missed_locked(
+                    connection, task.id, now=now
+                )
+                if not missed:
+                    continue
+                connection.execute(
+                    "UPDATE bridge_tasks SET updated_at = ?, revision = revision + 1 "
+                    "WHERE task_id = ?",
+                    (now, task.id),
+                )
+                updated = self._task_locked(connection, task.id)
+                assert updated is not None
+                self._record_task_event_locked(connection, updated)
+                self._queue_task_card_locked(connection, updated)
+                self._queue_missed_notes_notice_locked(connection, updated, missed)
+                reconciled += missed
+        return reconciled
+
     def transition_task(
         self,
         task_id: str,
@@ -627,10 +703,16 @@ class BridgeState:
                 f"UPDATE bridge_tasks SET {assignments} WHERE task_id = ?",
                 (*changes.values(), normalized),
             )
+            missed_notes = 0
+            if next_status == "returning" or next_status in TERMINAL_TASK_STATUSES:
+                missed_notes = self._mark_unread_notes_missed_locked(
+                    connection, normalized, now=now
+                )
             updated = self._task_locked(connection, normalized)
             assert updated is not None
             self._record_task_event_locked(connection, updated)
             self._queue_task_card_locked(connection, updated)
+            self._queue_missed_notes_notice_locked(connection, updated, missed_notes)
             return updated
 
     def acknowledge_dispatch(

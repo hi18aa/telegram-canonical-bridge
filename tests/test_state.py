@@ -138,14 +138,29 @@ class BridgeStateTests(unittest.TestCase):
         inbox_task, notes = self.state.read_task_notes(task.id, mark_read=True)
         self.assertEqual([note.text for note in notes], ["請先確認登入狀態"])
         self.assertEqual(inbox_task.pending_notes, 0)
+        _late_task, accepted, _detail = self.state.add_task_note(
+            task_id=task.id,
+            chat_id="10",
+            user_id="20",
+            telegram_message_id="user-note-before-final",
+            text="這則留言來不及在 final 前讀取",
+        )
+        self.assertTrue(accepted)
         returning = self.state.complete_worker_turn(
             "worker-session",
             "worker-turn",
             assistant_response=f"已完成\n[TCB-TASK:{task.id}] 的公開結果。",
         )
         self.assertEqual(returning.status, "returning")
+        self.assertEqual(returning.pending_notes, 0)
         self.assertEqual(returning.progress, "OT 最終回覆：已完成 [task] 的公開結果。")
         self.assertEqual(returning.evidence, "hook:post_llm_call (sanitized final fallback)")
+        queued_after_final = self.state.claim_due_outbox()
+        missed_notices = [record for record in queued_after_final if record.kind == "notice"]
+        self.assertEqual(len(missed_notices), 1)
+        self.assertIn("未及讀取 1 則", missed_notices[0].content)
+        for record in queued_after_final:
+            self.state.mark_outbox_sent(record.id, f"after-final-{record.id}")
         _returning, accepted, detail = self.state.add_task_note(
             task_id=task.id,
             chat_id="10",
@@ -172,6 +187,45 @@ class BridgeStateTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertTrue(terminal.terminal)
         self.assertIn("已結束", detail)
+
+    def test_startup_reconciles_unread_notes_left_on_closed_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "closed-notes.sqlite3"
+            state = BridgeState(path)
+            task, _created = state.create_task(
+                chat_id="10",
+                origin_profile="default",
+                origin_session_id="controller-session",
+                origin_turn_id="controller-turn",
+                origin_tool_call_id="closed-note-call",
+                target="worker",
+            )
+            _updated, accepted, _detail = state.add_task_note(
+                task_id=task.id,
+                chat_id="10",
+                user_id="20",
+                telegram_message_id="legacy-unread-note",
+                text="舊版完成後遺留的未讀留言",
+            )
+            self.assertTrue(accepted)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE bridge_tasks SET status = 'completed' WHERE task_id = ?",
+                    (task.id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            restarted = BridgeState(path)
+            self.assertEqual(restarted.task(task.id).pending_notes, 0)
+            notices = [
+                record for record in restarted.claim_due_outbox()
+                if record.kind == "notice"
+            ]
+            self.assertEqual(len(notices), 1)
+            self.assertIn("未及讀取 1 則", notices[0].content)
 
     def test_existing_v1_outbox_is_migrated_with_task_id_column(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
