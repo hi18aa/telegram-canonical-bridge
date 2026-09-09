@@ -21,10 +21,30 @@ from pathlib import Path
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_PLUGIN_TOOLSETS = {"agent_tasks", "telegram_canonical_bridge"}
 
 
 class TargetBusyError(TimeoutError):
     pass
+
+
+def _filter_plugin_toolset_startup_warning(text: str) -> str:
+    """移除 Hermes 啟動競態造成、且僅指向本 plugin 的已知假警告。"""
+
+    kept: list[str] = []
+    prefix = "Warning: Unknown toolsets:"
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            names = {
+                item.strip()
+                for item in stripped[len(prefix):].split(",")
+                if item.strip()
+            }
+            if names and names <= _PLUGIN_TOOLSETS:
+                continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 class _ProfileLock:
@@ -121,11 +141,15 @@ def run(argv: list[str] | None = None) -> int:
                 encoding="utf-8",
                 errors="replace",
             )
-        for stream, content in ((sys.stdout, completed.stdout), (sys.stderr, completed.stderr)):
+        stdout = _filter_plugin_toolset_startup_warning(completed.stdout)
+        stderr = _filter_plugin_toolset_startup_warning(completed.stderr)
+        for stream, content in ((sys.stdout, stdout), (sys.stderr, stderr)):
             if content:
                 stream.write(content)
+                if not content.endswith("\n"):
+                    stream.write("\n")
                 stream.flush()
-        if completed.returncode != 0 and "already has a live owner" in (completed.stderr or "").lower():
+        if completed.returncode != 0 and "already has a live owner" in stderr.lower():
             print(json.dumps({
                 "error": "target Bot Chat is open on another surface",
                 "reason": "target_busy",

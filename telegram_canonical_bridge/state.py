@@ -1349,6 +1349,35 @@ class BridgeState:
             native=True, limit=limit, lease_seconds=lease_seconds
         )
 
+    def pending_native_routes(self) -> set[str]:
+        """回傳尚未完成的原生 sidecar 路由，不領取或改變 outbox。"""
+
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT chat_id FROM outbox "
+                "WHERE chat_id LIKE 'native:%' "
+                "AND status IN ('pending', 'retry', 'sending')"
+            ).fetchall()
+        return {str(row["chat_id"]) for row in rows}
+
+    def next_native_outbox_wait(self) -> float | None:
+        """距離下一筆可依序領取的原生事件還要等幾秒；沒有事件時回傳 ``None``。"""
+
+        now = time.time()
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT MIN(CASE WHEN o.status = 'sending' "
+                "THEN COALESCE(o.lease_until, 0) ELSE o.next_attempt_at END) AS ready_at "
+                "FROM outbox o WHERE o.chat_id LIKE 'native:%' "
+                "AND o.status IN ('pending', 'retry', 'sending') "
+                "AND (o.task_id IS NULL OR NOT EXISTS ("
+                "SELECT 1 FROM outbox prior WHERE prior.task_id = o.task_id "
+                "AND prior.id < o.id AND prior.status <> 'sent'))"
+            ).fetchone()
+        if row is None or row["ready_at"] is None:
+            return None
+        return max(0.0, float(row["ready_at"]) - now)
+
     def mark_outbox_sent(self, record_id: int, telegram_message_id: str) -> None:
         with self._transaction() as connection:
             row = connection.execute(

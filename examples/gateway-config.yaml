@@ -1,5 +1,5 @@
 # 合併到 Controller 的 <HERMES_HOME>/config.yaml。
-# 秘密一律放在 <HERMES_HOME>/.env，不要寫進這個檔案。
+# Telegram token、allowlist 與 home channel 仍由 `hermes gateway setup` 管理。
 
 plugins:
   enabled:
@@ -7,51 +7,45 @@ plugins:
   entries:
     telegram-canonical-bridge:
       allow_tool_override: false
+      settings:
+        # 使用 Hermes 原生 Telegram home channel 傳送任務時間線。
+        # 若要固定 chat，可改為 telegram:<chat_id>。
+        delivery_target: telegram
 
-# 也可用以下命令加入，不必手動編輯：
-# hermes tools enable telegram_canonical_bridge --platform cli
+        # 只有列出的主 Agent profiles 可以建立與管理任務。
+        controller_profiles:
+          - default
+
+        # 建議明確列出允許的 worker profiles 與責任。
+        agents:
+          operitrace-agent:
+            role: OperiTrace 網站與瀏覽器操作助手
+          research-agent:
+            role: 研究與資料查證助手
+
+        # 同一 worker 的工作會序列化；等待前一任務的最長秒數。
+        lock_timeout_seconds: 3600
+
+        # 同機附件是否先複製到共用 plugin-data。
+        copy_attachments: true
+
+# Controller 的 Telegram surface 要啟用 plugin toolset；可用 CLI 命令設定：
+# hermes tools enable telegram_canonical_bridge --platform telegram
 platform_toolsets:
-  cli:
-    - hermes-cli
+  telegram:
+    - hermes-telegram
     - telegram_canonical_bridge
 
-# platforms 位於 config 根層，不是 gateway.platforms。
 platforms:
-  telegram_canonical_bridge:
+  # 這是 Hermes 原生 Telegram；其餘設定由 gateway setup 產生並保留。
+  telegram:
     enabled: true
-    extra:
-      # 本機 hermes serve 的 WebSocket endpoint；URL 不可包含 token。
-      backend_url: ws://127.0.0.1:9119/api/ws
 
-      # 必須已有未隱藏、未封存的 canonical Bot Chat。
-      controller_profile: default
+  # v0.4 的自管 adapter 只作相容保留。v0.5 sidecar 模式必須停用，
+  # 避免它與原生 Telegram 同時輪詢同一個 token。
+  telegram_canonical_bridge:
+    enabled: false
 
-      # 必填且預設拒絕所有人；只列出可信任的 Telegram numeric user ID。
-      allowed_user_ids:
-        - '123456789'
-
-      # 選填：再鎖定一個 private chat；通常 private chat ID 與 user ID 相同。
-      home_chat_id: '123456789'
-
-      # 預設會用 machine-root 共用 ledger。若自訂，Controller 與所有 OT
-      # profile 都必須以 TELEGRAM_CANONICAL_BRIDGE_STATE_PATH 指向同一路徑。
-      # state_path: C:\secure-data\telegram-canonical-bridge.sqlite3
-
-      telegram_poll_timeout_seconds: 40
-      history_poll_interval_seconds: 3
-
-      # 預設 timeline：重要任務事件各自成為新訊息。
-      # 改成 compact 可沿用 V2 的單一可編輯狀態卡。
-      task_presentation: timeline
-
-      # sendChatAction(typing) 的續期間隔；Telegram 狀態最多維持數秒。
-      typing_interval_seconds: 4
-
-      rpc_timeout_seconds: 25
-      retry_base_seconds: 2
-      retry_max_seconds: 60
-
-# 每個 OT profile 只需安裝／啟用 plugin 與 cli toolset，不要啟用 platform，
-# 也不需要 Telegram 或 backend secrets：
-# hermes -p operitrace-agent plugins install hi18aa/telegram-canonical-bridge --enable
+# 每個 worker profile 另行安裝／啟用 plugin 與 cli toolset：
+# hermes -p operitrace-agent plugins install https://github.com/hi18aa/telegram-canonical-bridge.git --enable
 # hermes -p operitrace-agent tools enable telegram_canonical_bridge --platform cli

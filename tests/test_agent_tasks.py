@@ -6,8 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from telegram_canonical_bridge import agent_tasks
-from telegram_canonical_bridge.native_delivery import flush_native_outbox
+from telegram_canonical_bridge import agent_task_runner, agent_tasks
+from telegram_canonical_bridge import native_delivery_runner
+from telegram_canonical_bridge.native_delivery import flush_native_outbox, kick_native_outbox
 from telegram_canonical_bridge.state import BridgeState
 
 
@@ -72,6 +73,21 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(flush_native_outbox(self.state), {"sent": 1, "failed": 0})
         self.assertEqual(self.state.claim_due_native_outbox(), [])
 
+    def test_single_flush_drains_ordered_events_for_same_task(self) -> None:
+        task = self._task()
+        self.state.transition_task(
+            task.id, status="running", progress="working", evidence="test"
+        )
+        self.state.transition_task(
+            task.id, status="returning", progress="result ready", evidence="test"
+        )
+        self.state.transition_task(
+            task.id, status="completed", progress="done", evidence="test", exit_code=0
+        )
+
+        self.assertEqual(flush_native_outbox(self.state), {"sent": 4, "failed": 0})
+        self.assertEqual(self.state.claim_due_native_outbox(), [])
+
     def test_native_delivery_uses_origin_profile_and_public_send_cli(self) -> None:
         task, _ = self.state.create_task(
             chat_id="native:telegram:123",
@@ -89,6 +105,46 @@ class AgentTaskTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[1:5], ["-p", "controller-two", "send", "--to"])
         self.assertEqual(argv[5], "telegram:123")
+
+    def test_remote_delivery_kick_is_non_blocking_background_process(self) -> None:
+        task, _ = self.state.create_task(
+            chat_id="native:telegram",
+            origin_profile="default",
+            origin_session_id="main-session",
+            origin_turn_id="turn-1",
+            origin_tool_call_id="call-kick",
+            target="operitrace-agent",
+            queue_outbox=False,
+        )
+        self.state.transition_task(task.id, status="dispatched", progress="sent", evidence="test")
+        with patch("telegram_canonical_bridge.native_delivery.subprocess.Popen") as popen:
+            self.assertTrue(kick_native_outbox(self.state))
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[1:3], ["-m", "telegram_canonical_bridge.native_delivery_runner"])
+        self.assertIn(str(self.state.path.resolve()), argv)
+
+    def test_delivery_runner_waits_for_deferred_record_and_drains_it(self) -> None:
+        task, _ = self.state.create_task(
+            chat_id="native:telegram",
+            origin_profile="default",
+            origin_session_id="main-session",
+            origin_turn_id="turn-1",
+            origin_tool_call_id="call-retry",
+            target="operitrace-agent",
+            queue_outbox=False,
+        )
+        self.state.transition_task(task.id, status="dispatched", progress="sent", evidence="test")
+        claimed = self.state.claim_due_native_outbox(limit=1)
+        self.assertEqual(len(claimed), 1)
+        self.state.defer_outbox(claimed[0].id, error="temporary", delay_seconds=0.1)
+        with patch("telegram_canonical_bridge.native_delivery._send_text", return_value=(True, "")):
+            exit_code = native_delivery_runner.run([
+                "--state", str(self.state.path),
+                "--max-runtime", "5",
+                "--idle-grace", "0.1",
+            ])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self.state.pending_native_routes(), set())
 
     def test_prepare_start_is_idempotent_per_tool_call(self) -> None:
         agent_tasks._SETTINGS = agent_tasks.AgentTaskSettings(delivery_target="local")
@@ -158,6 +214,38 @@ class AgentTaskTests(unittest.TestCase):
             ))
         self.assertTrue(result["deduplicated"])
         self.assertEqual(context.calls, [])
+
+    def test_runner_filters_only_its_known_false_positive_toolset_warning(self) -> None:
+        filtered = agent_task_runner._filter_plugin_toolset_startup_warning(
+            "Warning: Unknown toolsets: agent_tasks, telegram_canonical_bridge\nreal stderr"
+        )
+        self.assertEqual(filtered, "real stderr")
+        self.assertIn(
+            "unrelated",
+            agent_task_runner._filter_plugin_toolset_startup_warning(
+                "Warning: Unknown toolsets: unrelated"
+            ),
+        )
+
+    def test_slash_status_is_human_readable_instead_of_json(self) -> None:
+        rendered = agent_tasks._render_status_command(json.dumps({
+            "ok": True,
+            "tasks": [{
+                "task_id": "TCB-20260909-ABC123",
+                "target": "operitrace-agent",
+                "status": "running",
+                "status_label": "OT 處理中",
+                "progress": "正在安全檢查",
+                "worker_started": True,
+                "final_observed": False,
+                "exit_code": None,
+                "pending_notes": 1,
+                "evidence": "hook:pre_llm_call",
+            }],
+        }), detailed=True)
+        self.assertIn("📋 TCB-20260909-ABC123｜OT 處理中", rendered)
+        self.assertIn("Worker turn：已啟動", rendered)
+        self.assertNotIn("{\"ok\"", rendered)
 
     def test_cancel_tree_kills_process_and_marks_cancelled(self) -> None:
         context = _FakeContext(process_result={"status": "killed"})

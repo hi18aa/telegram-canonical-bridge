@@ -16,7 +16,7 @@ from typing import Any
 
 from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start, system_prompt_section
 from .config import shared_state_path
-from .native_delivery import flush_native_outbox
+from .native_delivery import kick_native_outbox
 from .state import BridgeState
 from .task_model import extract_task_id, sanitize_progress, task_marker
 
@@ -38,7 +38,7 @@ def _transition_task(state: BridgeState, task_id: str, **changes: Any):
     """更新 ledger 後，順手嘗試送出原生平台時間線；失敗仍留在 outbox。"""
 
     updated = state.transition_task(task_id, **changes)
-    flush_native_outbox(state)
+    kick_native_outbox(state)
     return updated
 
 
@@ -452,7 +452,7 @@ def _after_tool(
                         tool_call_id=tool_call_id,
                         delivery_status=delivery_status,
                     )
-                flush_native_outbox(state)
+                kick_native_outbox(state)
                 return
             error = str(
                 payload.get("error") or error_message or
@@ -462,7 +462,7 @@ def _after_tool(
                 state.fail_dispatch(
                     session_id=session_id, tool_call_id=tool_call_id, error=error
                 )
-                flush_native_outbox(state)
+                kick_native_outbox(state)
             return
 
         if tool_name in BRIDGE_TOOL_NAMES:
@@ -508,7 +508,7 @@ def _before_llm(
         )
         if bound is None:
             return None
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return {
             "context": (
                 f"這是 Telegram Canonical Bridge 追蹤任務 {task_id}。"
@@ -541,7 +541,7 @@ def _after_llm(
             turn_id,
             assistant_response=assistant_response,
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
     except Exception:
         logger.warning("Telegram canonical bridge post_llm_call observer failed", exc_info=True)
 
@@ -639,7 +639,7 @@ def bridge_task_inbox(args: dict[str, Any], **kwargs: Any) -> str:
         return _json({"ok": False, "error": error})
     acknowledge = bool(args.get("acknowledge", True))
     updated, notes = state.read_task_notes(task.id, mark_read=acknowledge)
-    flush_native_outbox(state)
+    kick_native_outbox(state)
     return _json({
         "ok": True,
         "task_id": task.id,

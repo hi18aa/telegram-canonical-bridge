@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import hermes_machine_root, shared_state_path
-from .native_delivery import flush_native_outbox, native_route
+from .native_delivery import kick_native_outbox, native_route
 from .task_model import TASK_STATUS_LABELS, normalize_task_id, sanitize_progress, task_marker
 
 
-TOOLSET_NAME = "agent_tasks"
+TOOLSET_NAME = "telegram_canonical_bridge"
 AGENT_TASK_TOOL_NAMES = frozenset({
     "agent_task_start",
     "agent_task_status",
@@ -374,7 +374,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             task.id, status="failed", progress="這個 profile 未獲准建立 sidecar 任務。",
             evidence="agent_task_start policy", last_error="controller profile not allowed",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "error": "此 profile 未列入 controller_profiles。"})
     roster = available_agents(profile)
     if target not in roster:
@@ -382,14 +382,14 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             task.id, status="failed", progress="目標不在可用 Bot roster。",
             evidence="agent_task_start validation", last_error=f"unknown target: {target}",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "error": "目標 Bot 不存在或未允許。", "agents": roster})
     if not message or len(message) > MESSAGE_MAX_CHARS:
         state.transition_task(
             task.id, status="failed", progress="派工內容無效。",
             evidence="agent_task_start validation", last_error="empty or oversized message",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "error": f"message 必須為 1–{MESSAGE_MAX_CHARS} 字元。"})
     message_file: Path | None = None
     try:
@@ -425,7 +425,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             progress="Hermes 已建立背景 runner；等待目標 Bot turn 的啟動證據。",
             evidence="agent_task_start background acknowledgement",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({
             "ok": True,
             "status": "sent",
@@ -449,7 +449,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             evidence="agent_task_start spawn failure",
             last_error=f"{type(exc).__name__}: {exc}",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "error": updated.last_error if updated else str(exc)})
 
 
@@ -476,7 +476,7 @@ def agent_task_message(args: dict[str, Any], **_kwargs: Any) -> str:
         text=message,
         note_id=secrets.token_hex(12),
     )
-    flush_native_outbox(state)
+    kick_native_outbox(state)
     return _json({
         "ok": accepted,
         "task_id": task.id if task else task_id,
@@ -508,7 +508,7 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
             evidence="agent_task_cancel missing process",
             last_error="cancellation could not be confirmed",
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "status": updated.status, "reason": "unconfirmed"})
     state.transition_task(
         task.id,
@@ -516,7 +516,7 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
         progress="主 Agent 已收到明確取消要求，正在終止背景程序樹。",
         evidence="agent_task_cancel requested",
     )
-    flush_native_outbox(state)
+    kick_native_outbox(state)
     raw = _CTX.dispatch_tool(
         "process_manage",
         {"action": "kill", "session_id": task.process_id},
@@ -536,7 +536,7 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
             evidence="process kill confirmed",
             exit_code=-15,
         )
-        flush_native_outbox(state)
+        kick_native_outbox(state)
         return _json({"ok": True, "task_id": task.id, "status": updated.status, "process": result_status})
     updated = state.transition_task(
         task.id,
@@ -545,23 +545,76 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
         evidence="agent_task_cancel unconfirmed",
         last_error=str(result.get("error") or result_status or "unknown process result"),
     )
-    flush_native_outbox(state)
+    kick_native_outbox(state)
     return _json({"ok": False, "task_id": task.id, "status": updated.status, "reason": "unconfirmed", "process": result})
+
+
+def _parse_tool_payload(raw: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _render_status_command(raw: str, *, detailed: bool) -> str:
+    payload = _parse_tool_payload(raw)
+    tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
+    if not tasks:
+        return "目前找不到這個 Controller 建立的任務。"
+    blocks: list[str] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "未知任務")
+        label = str(task.get("status_label") or task.get("status") or "未知狀態")
+        target = str(task.get("target") or "unknown")
+        progress = str(task.get("progress") or "尚無明確進度")
+        lines = [f"📋 {task_id}｜{label}", f"Bot：@{target}", f"進度：{progress}"]
+        if detailed:
+            lines.extend([
+                f"Worker turn：{'已啟動' if task.get('worker_started') else '尚未觀察'}",
+                f"Final：{'已觀察' if task.get('final_observed') else '尚無證據'}",
+                f"Exit code：{task.get('exit_code') if task.get('exit_code') is not None else '尚無'}",
+                f"待讀留言：{int(task.get('pending_notes') or 0)}",
+                f"證據：{task.get('evidence') or '尚無'}",
+            ])
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) if blocks else "目前沒有任務。"
+
+
+def _render_action_command(raw: str, *, success_label: str) -> str:
+    payload = _parse_tool_payload(raw)
+    task_id = str(payload.get("task_id") or "")
+    if payload.get("ok"):
+        detail = str(payload.get("detail") or "").strip()
+        return f"{success_label}{f' {task_id}' if task_id else ''}" + (f"\n{detail}" if detail else "")
+    detail = str(payload.get("detail") or payload.get("error") or payload.get("reason") or "操作未完成")
+    return f"⚠️ {task_id + '｜' if task_id else ''}{detail}"
 
 
 def _slash_command(raw_args: str) -> str:
     parts = str(raw_args or "").strip().split(maxsplit=2)
     if not parts or parts[0].lower() in {"list", "status"} and len(parts) == 1:
-        return agent_task_status({})
+        return _render_status_command(agent_task_status({}), detailed=False)
     action = parts[0].lower()
     if action == "status" and len(parts) >= 2:
-        return agent_task_status({"task_id": parts[1]})
+        return _render_status_command(
+            agent_task_status({"task_id": parts[1]}), detailed=True
+        )
     if action == "cancel" and len(parts) >= 2:
-        return agent_task_cancel({"task_id": parts[1]})
+        return _render_action_command(
+            agent_task_cancel({"task_id": parts[1]}), success_label="🛑 已取消"
+        )
     if action == "message" and len(parts) >= 3:
-        return agent_task_message({"task_id": parts[1], "message": parts[2]})
+        return _render_action_command(
+            agent_task_message({"task_id": parts[1], "message": parts[2]}),
+            success_label="✉️ 已加入任務留言",
+        )
     if normalize_task_id(parts[0]):
-        return agent_task_status({"task_id": parts[0]})
+        return _render_status_command(
+            agent_task_status({"task_id": parts[0]}), detailed=True
+        )
     return "用法：/agenttask [list|status <ID>|message <ID> <內容>|cancel <ID>]"
 
 
