@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -15,6 +16,7 @@ from .state import BridgeState, InboundRecord
 
 
 logger = logging.getLogger(__name__)
+RETURNING_PROCESS_MISSING_GRACE_SECONDS = 15.0
 
 
 class CanonicalUnavailable(RuntimeError):
@@ -288,6 +290,21 @@ class CanonicalBridgeService:
                 continue
             row = processes.get(task.process_id)
             if row is None:
+                # agents.list 是短生命週期全域摘要；process 結束或 backend
+                # 重啟後，row 可能直接消失而不留下 exited tombstone。post_llm_call
+                # 已證明 final 產生，因此經過 grace 後可誠實結案，不讓任務永久
+                # 停在 returning。這不宣稱 Hermes 原生通知一定送達 Controller。
+                if (
+                    task.status == "returning"
+                    and time.time() - task.updated_at >= RETURNING_PROCESS_MISSING_GRACE_SECONDS
+                ):
+                    updated = self.state.observe_process(
+                        task.id,
+                        process_status="absent_after_final",
+                        exit_code=None,
+                    )
+                    if updated and updated.status != task.status:
+                        changed += 1
                 continue
             raw_exit = row.get("exit_code")
             try:

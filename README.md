@@ -27,7 +27,7 @@ V2 保留 Hermes 原生 `message_agent`，在外面加上一層耐久協調：
 | 明確進度 | OT 呼叫 `bridge_task_update` 回報可驗證里程碑；最終里程碑使用 `status=result` | OT 的內部思考或逐 token 串流 |
 | 最終結果保底 | `post_llm_call` 的 final assistant response 經清理、截短後寫入任務卡；`status=result` 的明確結果優先 | Controller 已收到 Hermes 背景通知 |
 | OT 已產生回覆 | OT `post_llm_call` 已執行 | Controller 已收到 Hermes 原生通知 |
-| 已完成 | OT 已產生最終答覆且程序已結束，或 telemetry 明確取得 exit code 0 | 每個外部系統都一定成功 |
+| 已完成 | OT 已產生 final，且程序為 exited 或經 grace 後不再出現在全域摘要；也可由 exit code 0 證明 | Controller 已收到原生通知，或每個外部系統都一定成功 |
 | 結果待確認 | 程序已結束，但全域摘要沒有 exit code／final hook | 工作成功或失敗 |
 
 這不是遠端桌面監看，也不會公開 chain-of-thought。若 OT 要說「頁面已開啟」，仍必須先有相應工具成功的結果。狀態卡提供的是可驗證的生命週期，不是假裝能看見 agent 的每一步。
@@ -243,7 +243,7 @@ SQLite ledger 不會因停用 plugin 自動刪除。確認不再需要歷史與�
 - OT 產生 final 時仍未讀的留言會標為 `missed` 並另發警告；它們不會被偷偷套用到已結束的工作。
 - Hermes 原生背景完成通知是否喚醒 Controller，取決於當時是否仍有合適的 live session owner；bridge 不偽造這項保證，耐久結果面是 Telegram 任務卡。
 - Hermes 的事件 replay 是有界 buffer；重啟或長時間中斷後可能缺少中間狀態，但 SQLite 中的 final hook 結果與 process 狀態仍可恢復主要任務狀態。
-- `completed` 是 final hook 加程序結束，或 exit code 0 的證據，不是對任務內容正確性的保證；缺少足夠證據時會顯示「結果待確認」。
+- `completed` 是 final hook 加程序 exited／經 grace 後已不在全域摘要，或 exit code 0 的證據，不是 Controller 收到原生通知或任務內容正確性的保證；缺少足夠證據時會顯示「結果待確認」。
 
 更完整的資料模型、相容性策略與故障行為見 [`docs/實作設計與驗收.md`](docs/實作設計與驗收.md)。
 

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from telegram_canonical_bridge.config import BridgeConfig
 from telegram_canonical_bridge.hermes_rpc import RpcError
@@ -267,6 +268,59 @@ class CanonicalBridgeServiceTests(unittest.TestCase):
                 self.assertEqual(await service.sync_task_telemetry(), 1)
                 self.assertEqual(state.task(nested.id).status, "finished")
                 self.assertIn("agents.list", [method for method, _params in backend.calls])
+
+        asyncio.run(scenario())
+
+    def test_final_task_completes_when_process_summary_disappears(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                config = BridgeConfig(
+                    bot_token="telegram-token", backend_token="backend-token",
+                    backend_url="ws://127.0.0.1:9119/api/ws", controller_profile="default",
+                    allowed_user_ids=("20",), state_path=Path(directory) / "bridge.sqlite3",
+                    home_chat_id=None, telegram_poll_timeout_seconds=40,
+                    history_poll_interval_seconds=3, rpc_timeout_seconds=25,
+                    retry_base_seconds=1, retry_max_seconds=10,
+                )
+                backend = FakeBackend()
+                state = BridgeState(config.state_path)
+                state.set_canonical_binding(
+                    controller_profile="default",
+                    root_id="root-bot-chat",
+                    runtime_id="runtime-bot-chat",
+                )
+                task, _created = state.create_task(
+                    chat_id="10", origin_profile="default",
+                    origin_session_id="runtime-bot-chat", origin_turn_id="turn-1",
+                    origin_tool_call_id="tool-1", target="operitrace-agent",
+                )
+                state.acknowledge_dispatch(
+                    session_id="runtime-bot-chat",
+                    tool_call_id="tool-1",
+                    process_id="process-that-was-removed",
+                )
+                state.bind_worker(
+                    task.id, worker_profile="operitrace-agent",
+                    worker_session_id="worker-session", worker_turn_id="worker-turn",
+                )
+                state.complete_worker_turn(
+                    "worker-session", "worker-turn", assistant_response="可公開結果"
+                )
+                service = CanonicalBridgeService(
+                    config,
+                    state,
+                    rpc_factory=lambda _url, _token, _timeout: FakeRpc(backend),  # type: ignore[arg-type]
+                )
+
+                with patch(
+                    "telegram_canonical_bridge.service.RETURNING_PROCESS_MISSING_GRACE_SECONDS",
+                    0,
+                ):
+                    self.assertEqual(await service.sync_task_telemetry(), 1)
+                completed = state.task(task.id)
+                self.assertEqual(completed.status, "completed")
+                self.assertIn("absent after grace", completed.evidence)
+                self.assertIn("可公開結果", completed.progress)
 
         asyncio.run(scenario())
 

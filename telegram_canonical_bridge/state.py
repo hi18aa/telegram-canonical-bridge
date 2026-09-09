@@ -841,6 +841,13 @@ class BridgeState:
                 exit_code=int(exit_code),
                 last_error=f"background process exit code {int(exit_code)}",
             )
+        if normalized_status == "absent_after_final" and task.status == "returning":
+            return self.transition_task(
+                task.id,
+                status="completed",
+                progress=task.progress or "OT 已產生最終回覆。",
+                evidence="post_llm_call + agents.list: absent after grace",
+            )
         return task
 
     def complete_worker_turn(
