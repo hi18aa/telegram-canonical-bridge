@@ -102,6 +102,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--target", required=True)
     parser.add_argument("--task-id", required=True)
+    parser.add_argument("--state", required=True)
     parser.add_argument("--message-file", required=True)
     parser.add_argument("--lock-root", required=True)
     parser.add_argument("--lock-timeout", type=float, default=3600.0)
@@ -109,13 +110,59 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _record_completion(
+    state_path: Path,
+    task_id: str,
+    *,
+    exit_code: int,
+    output: str = "",
+    diagnostic: str = "",
+    reason: str = "",
+) -> bool:
+    """直接收斂 durable ledger；來源 session 的完成通知只是第二條保險。"""
+
+    try:
+        # 這支檔案以 script path 啟動；加入 plugin root 後再 import 自己的 package。
+        package_root = Path(__file__).resolve().parent.parent
+        if str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+        from telegram_canonical_bridge.native_delivery import kick_native_outbox
+        from telegram_canonical_bridge.state import BridgeState
+        from telegram_canonical_bridge.task_completion import (
+            completion_reason,
+            settle_task_completion,
+        )
+
+        state = BridgeState(state_path)
+        updated = settle_task_completion(
+            state,
+            task_id,
+            exit_code=exit_code,
+            output=output,
+            reason=reason or completion_reason(f"{output}\n{diagnostic}"),
+            origin="task runner",
+        )
+        if updated is not None:
+            kick_native_outbox(state)
+        return updated is not None
+    except Exception:
+        # Hermes 的來源 session completion hook 仍可補做收斂；runner 不因 ledger
+        # 暫時失敗而抹掉已取得的 Bot final output。
+        return False
+
+
 def run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     target = str(args.target).strip()
     task_id = str(args.task_id).strip().upper()
+    state_path = Path(args.state).resolve()
     # ``hermes chat --in ~`` 會先切換工作目錄；query-file 必須固定為絕對路徑。
     message_file = Path(args.message_file).resolve()
     if not PROFILE_RE.fullmatch(target):
+        if TASK_ID_RE.fullmatch(task_id):
+            _record_completion(
+                state_path, task_id, exit_code=2, reason="invalid_target"
+            )
         print(json.dumps({"error": "invalid target profile", "reason": "invalid_target"}))
         return 2
     if not TASK_ID_RE.fullmatch(task_id):
@@ -155,22 +202,40 @@ def run(argv: list[str] | None = None) -> int:
             )
         stdout = _filter_plugin_toolset_startup_warning(completed.stdout)
         stderr = _filter_plugin_toolset_startup_warning(completed.stderr)
+        busy = (
+            completed.returncode != 0
+            and "already has a live owner" in stderr.lower()
+        )
+        _record_completion(
+            state_path,
+            task_id,
+            exit_code=int(completed.returncode),
+            output=stdout,
+            diagnostic=stderr,
+            reason="target_busy" if busy else "",
+        )
         for stream, content in ((sys.stdout, stdout), (sys.stderr, stderr)):
             if content:
                 stream.write(content)
                 if not content.endswith("\n"):
                     stream.write("\n")
                 stream.flush()
-        if completed.returncode != 0 and "already has a live owner" in stderr.lower():
+        if busy:
             print(json.dumps({
                 "error": "task conversation is open on another surface",
                 "reason": "target_busy",
             }))
         return int(completed.returncode)
     except TargetBusyError as exc:
+        _record_completion(
+            state_path, task_id, exit_code=75, reason="target_busy"
+        )
         print(json.dumps({"error": str(exc), "reason": "target_busy"}))
         return 75
     except Exception as exc:
+        _record_completion(
+            state_path, task_id, exit_code=1, reason="runner_error"
+        )
         print(
             json.dumps({
                 "error": f"{type(exc).__name__}: {exc}",

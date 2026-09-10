@@ -18,6 +18,7 @@ from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start, system_prompt_sec
 from .config import shared_state_path
 from .native_delivery import kick_native_outbox
 from .state import BridgeState
+from .task_completion import completion_reason, settle_task_completion
 from .task_model import extract_task_id, sanitize_progress
 
 
@@ -55,9 +56,6 @@ _CURRENT_COMPLETION_RE = re.compile(
     r"\(exit code\s+(?P<exit_code>-?\d+|\?)(?:,[^)]+)?\)\.",
     re.IGNORECASE | re.DOTALL,
 )
-_REASON_RE = re.compile(r"\[reason:\s*([a-z0-9_-]+)\]", re.IGNORECASE)
-
-
 def _parse_process_completion(value: object) -> _ProcessCompletion | None:
     """讀取 Hermes 公開的背景完成通知；格式不符時完全忽略。
 
@@ -77,101 +75,12 @@ def _parse_process_completion(value: object) -> _ProcessCompletion | None:
         output = text[position + len(delimiter):].rstrip()
         if output.endswith("]"):
             output = output[:-1].rstrip()
-    reason_match = _REASON_RE.search(output)
-    reason = reason_match.group(1).lower() if reason_match else ""
-    if not reason:
-        try:
-            payload = json.loads(output)
-        except (TypeError, ValueError):
-            payload = None
-        if isinstance(payload, dict):
-            reason = str(payload.get("reason") or "").strip().lower()
-    if not reason and "already has a live owner" in output.lower():
-        reason = "target_busy"
     return _ProcessCompletion(
         process_id=match.group("process_id"),
         exit_code=exit_code,
         output=output,
-        reason=reason,
+        reason=completion_reason(output),
     )
-
-
-def _completion_reply_summary(output: str) -> str:
-    """擷取 runner stdout 中預期可回給原提問者的 agent 答覆。
-
-    非零 exit 的任意輸出不會走到此函式；錯誤只以類型化原因呈現，避免把
-    command、stack trace 或意外秘密複製到使用者訊息平台。
-    """
-
-    text = str(output or "").strip()
-    if not text or text == "(empty reply)":
-        return ""
-    reply_match = re.search(r"(?:^|\n)Reply from [^\n]+:\s*\n(?P<reply>[\s\S]+)$", text)
-    if reply_match:
-        text = reply_match.group("reply").strip()
-    lines = [
-        line
-        for line in text.splitlines()
-        if not line.strip().lower().startswith(
-            ("warning: unknown toolsets:", "resuming session:", "session id:")
-        )
-    ]
-    return sanitize_progress("\n".join(lines), limit=1000)
-
-
-def _completion_failure_message(completion: _ProcessCompletion) -> tuple[str, str]:
-    reason = completion.reason or "unknown"
-    messages = {
-        "target_busy": (
-            "這個任務的隔離對話被其他 surface 持有，背景 runner 未能啟動 Bot turn。",
-            "請關閉同名 task conversation 後再建立新任務；不要把 sent 當成已交付。",
-        ),
-        "runtime_offline": (
-            "目標 Hermes runtime 離線，背景派工未完成。",
-            "目標 runtime 離線。",
-        ),
-        "delivery_timeout": (
-            "等待目標回覆逾時，bridge 無法確認 Bot 是否完成。",
-            "delivery timeout；不要盲目重派。",
-        ),
-        "queued_expired": (
-            "Hermes 的排隊派工已過期，Bot turn 未完成。",
-            "queued delivery expired。",
-        ),
-        "provider_auth_or_access": (
-            "Bot provider 驗證或存取失敗，沒有完成回覆。",
-            "provider authentication/access failure。",
-        ),
-        "provider_quota_limit": (
-            "Bot provider 額度不足，沒有完成回覆。",
-            "provider quota limit。",
-        ),
-        "provider_rate_limit": (
-            "Bot provider 暫時限流，沒有完成回覆。",
-            "provider rate limit。",
-        ),
-        "provider_server_error": (
-            "Bot provider 發生伺服器錯誤，沒有完成回覆。",
-            "provider server error。",
-        ),
-        "missing_config": (
-            "Bot 缺少執行所需設定，沒有開始或完成 turn。",
-            "target profile configuration is incomplete。",
-        ),
-        "model_unavailable": (
-            "Bot 指定模型不可用，沒有完成回覆。",
-            "target model unavailable。",
-        ),
-        "context_overflow": (
-            "Bot 對話 context overflow，重試後仍未完成。",
-            "target context overflow。",
-        ),
-        "unknown": (
-            "背景派工 runner 失敗，且 Hermes 未提供可分類原因。",
-            "runner failed；請查看目標 Hermes log 與 Controller 的完成通知。",
-        ),
-    }
-    return messages.get(reason, messages["unknown"])
 
 
 def _observe_process_completion(state: BridgeState, value: object) -> bool:
@@ -181,74 +90,15 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
     task = state.task_by_process_id(completion.process_id)
     if task is None:
         return True
-
-    if completion.exit_code is not None and completion.exit_code != 0:
-        if task.status == "returning":
-            _transition_task(
-                state,
-                task.id,
-                status="completed",
-                evidence=(
-                    "hook:post_llm_call + Hermes completion notification "
-                    f"(exit {completion.exit_code})"
-                ),
-                exit_code=completion.exit_code,
-            )
-            return True
-        progress, detail = _completion_failure_message(completion)
-        _transition_task(
-            state,
-            task.id,
-            status="failed",
-            progress=progress,
-            evidence=(
-                "Hermes completion notification: exit "
-                f"{completion.exit_code}; reason={completion.reason or 'unknown'}"
-            ),
-            exit_code=completion.exit_code,
-            last_error=detail,
-        )
-        return True
-
-    if completion.exit_code == 0:
-        summary = _completion_reply_summary(completion.output)
-        if task.status == "returning" or summary:
-            _transition_task(
-                state,
-                task.id,
-                status="completed",
-                progress=(
-                    task.progress
-                    if task.status == "returning"
-                    else f"Bot runner 回覆：{summary}"
-                ),
-                evidence="Hermes completion notification: exit 0 with reply",
-                exit_code=0,
-            )
-        else:
-            _transition_task(
-                state,
-                task.id,
-                status="unconfirmed",
-                progress=(
-                    "背景 runner 回報 exit 0，但沒有 Bot final hook 或可辨識回覆；"
-                    "bridge 無法宣稱任務完成。"
-                ),
-                evidence="Hermes completion notification: exit 0 without reply",
-                exit_code=0,
-            )
-        return True
-
-    _transition_task(
+    settle_task_completion(
         state,
         task.id,
-        status="unconfirmed",
-        progress=(
-            "Hermes 已送來背景 runner 完成通知，但沒有 exit code；"
-            "尚無足夠證據判定 Bot 成功或失敗。"
-        ),
-        evidence="Hermes completion notification: exit code unavailable",
+        exit_code=completion.exit_code,
+        output=completion.output,
+        reason=completion.reason,
+        origin="Hermes completion notification",
     )
+    kick_native_outbox(state)
     return True
 
 def _state() -> BridgeState:

@@ -65,7 +65,8 @@ runner：
 2. 取得同一 worker 的 OS lock 後呼叫公開 `hermes chat`。
 3. Worker `pre_llm_call` 出現後才標記 `running`。
 4. Worker 以 `bridge_task_update` 回報重要里程碑。
-5. `post_llm_call` 與 process completion 共同收斂 completed。
+5. runner 直接寫入 process completion；來源 session notification 用相同規則再確認。
+6. `post_llm_call` 與 process completion 共同收斂 completed。
 
 使用者會收到新的 Telegram 任務事件，不會只看到一張持續被改寫的卡片。
 

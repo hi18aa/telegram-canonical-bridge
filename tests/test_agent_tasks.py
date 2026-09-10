@@ -168,7 +168,8 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(self.state.task(task.id).process_id, "proc_test1234")
 
     def test_runner_uses_unique_task_conversation_instead_of_bot_chat(self) -> None:
-        task_id = "TCB-20260910-ABC123"
+        task = self._task()
+        task_id = task.id
         message = Path(self.temp.name) / "message.txt"
         message.write_text("safe test", encoding="utf-8")
         completed = Mock(returncode=0, stdout="done", stderr="")
@@ -178,6 +179,8 @@ class AgentTaskTests(unittest.TestCase):
                 "operitrace-agent",
                 "--task-id",
                 task_id,
+                "--state",
+                str(self.state.path),
                 "--message-file",
                 str(message),
                 "--lock-root",
@@ -191,6 +194,7 @@ class AgentTaskTests(unittest.TestCase):
         self.assertNotIn("Bot Chat", argv)
         self.assertEqual(argv[argv.index("--source") + 1], "tool")
         self.assertFalse(message.exists())
+        self.assertEqual(self.state.task(task_id).status, "completed")
 
     def test_reentered_start_does_not_spawn_duplicate_runner(self) -> None:
         context = _FakeContext()

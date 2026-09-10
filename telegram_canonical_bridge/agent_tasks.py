@@ -310,6 +310,8 @@ def _runner_command(target: str, task_id: str, message_file: Path) -> str:
         target,
         "--task-id",
         task_id,
+        "--state",
+        str(shared_state_path().resolve()),
         "--message-file",
         str(message_file),
         "--lock-root",

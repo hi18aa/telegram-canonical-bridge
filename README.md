@@ -32,6 +32,7 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 - 不同主 Agent 或不同 task 不共用 Bot 對話內容，不會混 session。
 - 同一個 Bot profile 的 runner 依序執行，避免瀏覽器或本機資源互撞；不同 profiles 可並行。
 - `sent` 只表示背景 runner 已建立。看到 worker hook、明確進度或 final output 才能判定真正開始／完成。
+- runner 會直接收斂 durable ledger；來源 session 的 completion notification 是通知主 Agent 與第二條保險，不是唯一完成條件。
 - 進度以 Telegram 新訊息發布，不反覆改寫同一則舊卡片。
 - 一般新訊息不會中斷舊任務；明確取消才會終止 runner 程序樹。
 - 補充指示寫入 durable inbox，由 Bot 在自然檢查點讀取，不是假裝成即時 interrupt。
@@ -241,7 +242,7 @@ Telegram 附件仍由 Hermes 原生 adapter 接收。主 Agent 若取得同機�
 - `completed`：final 證據與 runner 結束已收斂，或 runner 有可辨識的 final output。
 - `unconfirmed`：runner 已結束，但缺少足夠 final 證據；不可描述成成功，也不可盲目重派。
 
-事件寫入 SQLite durable outbox，再透過公開 `hermes send` 依 task 保序傳送；暫時失敗會退避重試。
+事件寫入 SQLite durable outbox，再透過公開 `hermes send` 依 task 保序傳送；暫時失敗會退避重試。即使一次性 Controller CLI 已先結束，runner 仍會直接寫入最終狀態並喚醒 outbox。
 
 ## 疑難排解
 
