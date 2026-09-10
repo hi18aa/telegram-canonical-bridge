@@ -40,10 +40,20 @@ def _send_text(*, profile: str, target: str, content: str, spool_dir: Path) -> t
             stream.write(content)
         with suppress(OSError):
             path.chmod(0o600)
-        argv = [_hermes_executable()]
-        if profile and profile != "default":
-            argv.extend(["-p", profile])
-        argv.extend(["send", "--to", target, "--file", str(path), "--quiet"])
+        # 永遠明確指定來源 Controller profile。delivery runner 可能是由 worker
+        # hook 啟動，若 default 被省略，Hermes 會繼承 worker 的 HERMES_PROFILE，
+        # 進而在沒有 Telegram home channel 的 worker profile 中送信。
+        argv = [
+            _hermes_executable(),
+            "-p",
+            profile or "default",
+            "send",
+            "--to",
+            target,
+            "--file",
+            str(path),
+            "--json",
+        ]
         completed = subprocess.run(
             argv,
             check=False,
@@ -58,7 +68,7 @@ def _send_text(*, profile: str, target: str, content: str, spool_dir: Path) -> t
         if completed.returncode == 0:
             return True, ""
         detail = (completed.stderr or completed.stdout or "hermes send failed").strip()
-        return False, detail[-1000:]
+        return False, f"hermes send exit {completed.returncode}: {detail}"[-1000:]
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
     finally:

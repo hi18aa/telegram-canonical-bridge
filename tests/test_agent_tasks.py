@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -90,6 +92,35 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(argv[1:5], ["-p", "controller-two", "send", "--to"])
         self.assertEqual(argv[5], "telegram:123")
         self.assertIn("--file", argv)
+        self.assertIn("--json", argv)
+
+    def test_default_delivery_profile_is_explicit_even_inside_worker_process(self) -> None:
+        self._task(delivery_target="telegram", profile="default")
+        completed = Mock(returncode=0, stdout='{"success":true}', stderr="")
+        with patch(
+            "telegram_canonical_bridge.native_delivery.subprocess.run",
+            return_value=completed,
+        ) as run:
+            self.assertEqual(flush_native_outbox(self.state), {"sent": 1, "failed": 0})
+        self.assertEqual(run.call_args.args[0][1:3], ["-p", "default"])
+
+    def test_delivery_failure_keeps_structured_hermes_error(self) -> None:
+        self._task(delivery_target="telegram", profile="default")
+        completed = Mock(
+            returncode=1,
+            stdout='{"error":"No home channel set for telegram"}',
+            stderr="",
+        )
+        with patch(
+            "telegram_canonical_bridge.native_delivery.subprocess.run",
+            return_value=completed,
+        ):
+            self.assertEqual(flush_native_outbox(self.state), {"sent": 0, "failed": 1})
+        row = self.state.claim_due_outbox(limit=1)
+        self.assertEqual(row, [])
+        with closing(sqlite3.connect(self.state.path)) as connection:
+            error = connection.execute("SELECT last_error FROM outbox").fetchone()[0]
+        self.assertIn("No home channel set for telegram", error)
 
     def test_remote_delivery_kick_is_non_blocking(self) -> None:
         self._task(delivery_target="telegram")

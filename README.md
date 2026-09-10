@@ -242,7 +242,7 @@ Telegram 附件仍由 Hermes 原生 adapter 接收。主 Agent 若取得同機�
 - `completed`：final 證據與 runner 結束已收斂，或 runner 有可辨識的 final output。
 - `unconfirmed`：runner 已結束，但缺少足夠 final 證據；不可描述成成功，也不可盲目重派。
 
-事件寫入 SQLite durable outbox，再透過公開 `hermes send` 依 task 保序傳送；暫時失敗會退避重試。即使一次性 Controller CLI 已先結束，runner 仍會直接寫入最終狀態並喚醒 outbox。
+事件寫入 SQLite durable outbox，再透過公開 `hermes -p <Controller profile> send` 依 task 保序傳送；暫時失敗會退避重試。送信程序即使由 worker hook 喚醒，也會明確切回來源 Controller profile，不會誤用 worker 的 Telegram 設定。每個正常 Controller turn 也會重新喚醒尚未送完的 outbox。即使一次性 Controller CLI 已先結束，runner 仍會直接寫入最終狀態並喚醒 outbox。
 
 ## 疑難排解
 
@@ -275,7 +275,7 @@ hermes -p operitrace-agent chat -Q -q "只回覆 WORKER_OK"
 hermes send --list telegram
 ```
 
-`delivery_target: local` 只確認 ledger/outbox，不會真的傳 Telegram，適合測試。
+若工具是由非預設 Controller profile 使用，請改成 `hermes -p <profile> send --list telegram`。`delivery_target: local` 只確認 ledger/outbox，不會真的傳 Telegram，適合測試。
 
 ### 檢查 ledger
 

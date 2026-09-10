@@ -170,6 +170,13 @@ def system_prompt_section(session_info: Mapping[str, Any]) -> str:
     profile = str(session_info.get("profile_name") or "default")
     if profile not in _SETTINGS.controller_profiles:
         return ""
+    # 每個正常 Controller turn 都是修復暫時性 Telegram 中斷的自然喚醒點。
+    # 這只啟動非阻塞 runner；跨程序鎖會避免重複傳送。
+    try:
+        state, _current = _state_and_profile()
+        kick_native_outbox(state)
+    except Exception:
+        pass
     roster = available_agents(profile)
     if not roster:
         return ""
