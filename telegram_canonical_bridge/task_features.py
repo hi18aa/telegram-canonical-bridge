@@ -1,7 +1,7 @@
-"""Hermes hooks 與 OT 可呼叫的任務狀態工具。
+"""Hermes hooks 與專門 Bot 可呼叫的任務狀態工具。
 
-V4 不覆寫 message_agent。它只在原生呼叫前加入 opaque task marker，並以
-Hermes 公開 hook／tool API 把可驗證的狀態寫入共用 SQLite ledger。
+外掛只觀察自己的 ``agent_task_*`` 工作流程，不包裝或覆寫內建
+``message_agent``。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start, system_prompt_sec
 from .config import shared_state_path
 from .native_delivery import kick_native_outbox
 from .state import BridgeState
-from .task_model import extract_task_id, sanitize_progress, task_marker
+from .task_model import extract_task_id, sanitize_progress
 
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ BRIDGE_TOOL_NAMES = frozenset({
     "bridge_task_inbox",
     "bridge_task_status",
 }) | AGENT_TASK_TOOL_NAMES
-MESSAGE_AGENT_MAX_CHARS = 16_000
 _STATE_CACHE: dict[Path, BridgeState] = {}
 _STATE_CACHE_LOCK = threading.Lock()
 
@@ -56,36 +55,28 @@ _CURRENT_COMPLETION_RE = re.compile(
     r"\(exit code\s+(?P<exit_code>-?\d+|\?)(?:,[^)]+)?\)\.",
     re.IGNORECASE | re.DOTALL,
 )
-_LEGACY_COMPLETION_RE = re.compile(
-    r"^\s*\[Background process\s+(?P<process_id>[A-Za-z0-9_.:-]+)\s+"
-    r"finished with exit code\s+(?P<exit_code>-?\d+|\?)",
-    re.IGNORECASE | re.DOTALL,
-)
 _REASON_RE = re.compile(r"\[reason:\s*([a-z0-9_-]+)\]", re.IGNORECASE)
 
 
 def _parse_process_completion(value: object) -> _ProcessCompletion | None:
     """讀取 Hermes 公開的背景完成通知；格式不符時完全忽略。
 
-    同時接受目前的 ``[IMPORTANT: ... Output:]`` 與舊版 gateway 的
-    ``[Background process ... Here's the final output:]`` 形狀。解析器只用
-    opaque process ID 做 ledger 關聯，不讀 Command 欄位。
+    解析器只用 opaque process ID 做 ledger 關聯，不讀 Command 欄位。
     """
 
     text = str(value or "")
-    match = _CURRENT_COMPLETION_RE.match(text) or _LEGACY_COMPLETION_RE.match(text)
+    match = _CURRENT_COMPLETION_RE.match(text)
     if match is None:
         return None
     raw_exit = match.group("exit_code")
     exit_code = int(raw_exit) if raw_exit != "?" else None
     output = ""
-    for delimiter in ("\nOutput:\n", "Here's the final output:\n"):
-        position = text.find(delimiter, match.end())
-        if position >= 0:
-            output = text[position + len(delimiter):].rstrip()
-            if output.endswith("]"):
-                output = output[:-1].rstrip()
-            break
+    delimiter = "\nOutput:\n"
+    position = text.find(delimiter, match.end())
+    if position >= 0:
+        output = text[position + len(delimiter):].rstrip()
+        if output.endswith("]"):
+            output = output[:-1].rstrip()
     reason_match = _REASON_RE.search(output)
     reason = reason_match.group(1).lower() if reason_match else ""
     if not reason:
@@ -105,26 +96,15 @@ def _parse_process_completion(value: object) -> _ProcessCompletion | None:
     )
 
 
-def _is_live_delivery_ack(output: str) -> bool:
-    lowered = output.lower()
-    if "open bot chat" in lowered and "reply will appear there" in lowered:
-        return True
-    try:
-        payload = json.loads(output)
-    except (TypeError, ValueError):
-        return False
-    return isinstance(payload, dict) and str(payload.get("status") or "").lower() == "queued"
-
-
 def _completion_reply_summary(output: str) -> str:
     """擷取 runner stdout 中預期可回給原提問者的 agent 答覆。
 
     非零 exit 的任意輸出不會走到此函式；錯誤只以類型化原因呈現，避免把
-    command、stack trace 或意外秘密複製到 Telegram。
+    command、stack trace 或意外秘密複製到使用者訊息平台。
     """
 
     text = str(output or "").strip()
-    if not text or text == "(empty reply)" or _is_live_delivery_ack(text):
+    if not text or text == "(empty reply)":
         return ""
     reply_match = re.search(r"(?:^|\n)Reply from [^\n]+:\s*\n(?P<reply>[\s\S]+)$", text)
     if reply_match:
@@ -143,47 +123,47 @@ def _completion_failure_message(completion: _ProcessCompletion) -> tuple[str, st
     reason = completion.reason or "unknown"
     messages = {
         "target_busy": (
-            "目標 Bot Chat 被其他 surface 持有，背景 runner 未能啟動 OT turn。",
-            "請升級並重啟目標 Hermes backend；不要把 sent acknowledgement 當成已交付。",
+            "這個任務的隔離對話被其他 surface 持有，背景 runner 未能啟動 Bot turn。",
+            "請關閉同名 task conversation 後再建立新任務；不要把 sent 當成已交付。",
         ),
         "runtime_offline": (
             "目標 Hermes runtime 離線，背景派工未完成。",
             "目標 runtime 離線。",
         ),
         "delivery_timeout": (
-            "等待目標回覆逾時，bridge 無法確認 OT 是否完成。",
+            "等待目標回覆逾時，bridge 無法確認 Bot 是否完成。",
             "delivery timeout；不要盲目重派。",
         ),
         "queued_expired": (
-            "Hermes 的排隊派工已過期，OT turn 未完成。",
+            "Hermes 的排隊派工已過期，Bot turn 未完成。",
             "queued delivery expired。",
         ),
         "provider_auth_or_access": (
-            "OT provider 驗證或存取失敗，沒有完成回覆。",
+            "Bot provider 驗證或存取失敗，沒有完成回覆。",
             "provider authentication/access failure。",
         ),
         "provider_quota_limit": (
-            "OT provider 額度不足，沒有完成回覆。",
+            "Bot provider 額度不足，沒有完成回覆。",
             "provider quota limit。",
         ),
         "provider_rate_limit": (
-            "OT provider 暫時限流，沒有完成回覆。",
+            "Bot provider 暫時限流，沒有完成回覆。",
             "provider rate limit。",
         ),
         "provider_server_error": (
-            "OT provider 發生伺服器錯誤，沒有完成回覆。",
+            "Bot provider 發生伺服器錯誤，沒有完成回覆。",
             "provider server error。",
         ),
         "missing_config": (
-            "OT 缺少執行所需設定，沒有開始或完成 turn。",
+            "Bot 缺少執行所需設定，沒有開始或完成 turn。",
             "target profile configuration is incomplete。",
         ),
         "model_unavailable": (
-            "OT 指定模型不可用，沒有完成回覆。",
+            "Bot 指定模型不可用，沒有完成回覆。",
             "target model unavailable。",
         ),
         "context_overflow": (
-            "OT 對話 context overflow，重試後仍未完成。",
+            "Bot 對話 context overflow，重試後仍未完成。",
             "target context overflow。",
         ),
         "unknown": (
@@ -230,20 +210,6 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
         )
         return True
 
-    if completion.exit_code == 0 and _is_live_delivery_ack(completion.output):
-        _transition_task(
-            state,
-            task.id,
-            status="waiting",
-            progress=(
-                "Hermes 已把訊息排入目標的 live Bot Chat；這只是持久化收件回條，"
-                "尚未證明 OT turn 已啟動或完成。"
-            ),
-            evidence="Hermes completion notification: live delivery queued",
-            exit_code=0,
-        )
-        return True
-
     if completion.exit_code == 0:
         summary = _completion_reply_summary(completion.output)
         if task.status == "returning" or summary:
@@ -254,7 +220,7 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
                 progress=(
                     task.progress
                     if task.status == "returning"
-                    else f"OT runner 回覆：{summary}"
+                    else f"Bot runner 回覆：{summary}"
                 ),
                 evidence="Hermes completion notification: exit 0 with reply",
                 exit_code=0,
@@ -263,10 +229,10 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
             _transition_task(
                 state,
                 task.id,
-                status="waiting",
+                status="unconfirmed",
                 progress=(
-                    "背景 runner 回報 exit 0，但沒有 OT final hook 或可辨識回覆；"
-                    "bridge 暫不宣稱任務完成。"
+                    "背景 runner 回報 exit 0，但沒有 Bot final hook 或可辨識回覆；"
+                    "bridge 無法宣稱任務完成。"
                 ),
                 evidence="Hermes completion notification: exit 0 without reply",
                 exit_code=0,
@@ -276,10 +242,10 @@ def _observe_process_completion(state: BridgeState, value: object) -> bool:
     _transition_task(
         state,
         task.id,
-        status="waiting",
+        status="unconfirmed",
         progress=(
             "Hermes 已送來背景 runner 完成通知，但沒有 exit code；"
-            "尚無足夠證據判定 OT 成功或失敗。"
+            "尚無足夠證據判定 Bot 成功或失敗。"
         ),
         evidence="Hermes completion notification: exit code unavailable",
     )
@@ -309,29 +275,17 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-def _parsed_result(result: Any) -> dict[str, Any]:
-    if isinstance(result, dict):
-        return result
-    if not isinstance(result, str):
-        return {}
-    try:
-        parsed = json.loads(result)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _tool_activity(tool_name: str) -> tuple[str, str] | None:
     if tool_name.startswith("browser_"):
-        return "OT 正在操作瀏覽器；bridge 只確認到 browser tool 呼叫，不推測畫面結果。", "hook:browser"
+        return "Bot 正在操作瀏覽器；bridge 只確認到 browser tool 呼叫，不推測畫面結果。", "hook:browser"
     if tool_name == "computer_use":
-        return "OT 正在操作電腦介面；bridge 已觀察到 computer_use 呼叫。", "hook:computer_use"
+        return "Bot 正在操作電腦介面；bridge 已觀察到 computer_use 呼叫。", "hook:computer_use"
     if tool_name in {"terminal", "process_manage"}:
-        return "OT 正在執行或檢查本機程序。", "hook:terminal"
+        return "Bot 正在執行或檢查本機程序。", "hook:terminal"
     if tool_name in {"write_file", "patch"}:
-        return "OT 正在修改檔案。", "hook:file-write"
+        return "Bot 正在修改檔案。", "hook:file-write"
     if tool_name in {"web_search", "web_extract"}:
-        return "OT 正在查詢外部資料。", "hook:web"
+        return "Bot 正在查詢外部資料。", "hook:web"
     return None
 
 
@@ -343,7 +297,7 @@ def _before_tool(
     turn_id: str = "",
     **_: Any,
 ) -> dict[str, Any] | None:
-    """建立派工 intent、注入 marker，或記錄 OT 的高階工具活動。"""
+    """建立派工 intent，或記錄已綁定 worker 的高階工具活動。"""
 
     try:
         state = _state()
@@ -356,69 +310,27 @@ def _before_tool(
                 turn_id=str(turn_id or ""),
                 tool_call_id=str(tool_call_id or ""),
             )
-        if tool_name != "message_agent":
-            if tool_name in BRIDGE_TOOL_NAMES:
-                return None
-            task = state.task_for_worker(session_id, turn_id)
-            activity = _tool_activity(tool_name)
-            if (
-                task is not None
-                and not task.terminal
-                and activity is not None
-                and not state.latest_explicit_progress(task.id)
-            ):
-                # OT 的明確、使用者可見里程碑比後續泛用 tool category 更有資訊；
-                # 例如回報頁面標題後關閉 browser 所用的 terminal 不應抹掉結果。
-                _transition_task(
-                    state,
-                    task.id, status="running", progress=activity[0], evidence=activity[1]
-                )
+        if tool_name in BRIDGE_TOOL_NAMES:
             return None
-
-        parent = state.task_for_worker(session_id, turn_id)
-        if parent is not None and parent.terminal:
-            parent = None
-        route = (
-            (parent.origin_profile, parent.chat_id, "")
-            if parent is not None
-            else state.route_for_canonical_session(session_id)
-        )
-        if route is None:
-            # 只追蹤 Telegram 綁定的 canonical Bot Chat 與它派出的工作；
-            # 其他 CLI／Desktop session 的 message_agent 維持完全原生。
-            return None
-        target = str((args or {}).get("target") or "").strip()
-        body = str((args or {}).get("message") or "")
-        task, _created = state.create_task(
-            chat_id=route[1],
-            origin_profile=_current_profile(),
-            origin_session_id=str(session_id or ""),
-            origin_turn_id=str(turn_id or ""),
-            origin_tool_call_id=str(tool_call_id or ""),
-            target=target,
-            parent_task_id=parent.id if parent else None,
-        )
-        marker = task_marker(task.id)
-        tracked_body = body if extract_task_id(body) == task.id else f"{marker}\n{body}"
-        if len(tracked_body) > MESSAGE_AGENT_MAX_CHARS:
+        task = state.task_for_worker(session_id, turn_id)
+        activity = _tool_activity(tool_name)
+        if (
+            task is not None
+            and not task.terminal
+            and activity is not None
+            and not state.latest_explicit_progress(task.id)
+        ):
+            # Bot 的明確、使用者可見里程碑比後續泛用 tool category 更有資訊。
             _transition_task(
                 state,
-                task.id,
-                progress="派工內容接近 message_agent 上限，未注入 OT 追蹤 marker；仍保留程序狀態。",
-                evidence="hook:marker-skipped-size",
-            )
-            return None
-        if parent is not None and not parent.terminal:
-            _transition_task(
-                state,
-                parent.id,
                 status="running",
-                progress=f"OT 又透過 message_agent 派工給 @{target.lstrip('@')}。",
-                evidence="hook:nested-message_agent",
+                task_id=task.id,
+                progress=activity[0],
+                evidence=activity[1],
             )
-        return {"action": "modify", "args": {"message": tracked_body}}
+        return None
     except Exception:
-        logger.warning("Telegram canonical bridge pre_tool_call failed open", exc_info=True)
+        logger.warning("Agent Task Bridge pre_tool_call failed open", exc_info=True)
         return None
 
 
@@ -434,50 +346,24 @@ def _after_tool(
 ) -> None:
     try:
         state = _state()
-        if tool_name == "message_agent":
-            payload = _parsed_result(result)
-            process_id = str(payload.get("process_id") or "").strip()
-            delivery_status = str(payload.get("status") or "").strip().lower()
-            if delivery_status in {"sent", "queued"}:
-                if process_id:
-                    state.acknowledge_dispatch(
-                        session_id=session_id,
-                        tool_call_id=tool_call_id,
-                        process_id=process_id,
-                        delivery_status=delivery_status,
-                    )
-                else:
-                    state.acknowledge_without_process(
-                        session_id=session_id,
-                        tool_call_id=tool_call_id,
-                        delivery_status=delivery_status,
-                    )
-                kick_native_outbox(state)
-                return
-            error = str(
-                payload.get("error") or error_message or
-                "message_agent 未回傳可辨識的 sent／queued acknowledgement"
-            ).strip()
-            if error:
-                state.fail_dispatch(
-                    session_id=session_id, tool_call_id=tool_call_id, error=error
-                )
-                kick_native_outbox(state)
-            return
-
         if tool_name in BRIDGE_TOOL_NAMES:
             return
         task = state.task_for_worker(session_id, turn_id)
-        if task is not None and not task.terminal and status in {"error", "blocked"}:
+        if (
+            task is not None
+            and not task.terminal
+            and status in {"error", "blocked"}
+            and not state.latest_explicit_progress(task.id)
+        ):
             _transition_task(
                 state,
                 task.id,
                 status="running",
-                progress=f"OT 的 {tool_name} 呼叫未成功；OT 仍可調整後繼續。",
+                progress=f"Bot 的 {tool_name} 呼叫未成功；Bot 仍可調整後繼續。",
                 evidence=f"hook:{status}",
             )
     except Exception:
-        logger.warning("Telegram canonical bridge post_tool_call observer failed", exc_info=True)
+        logger.warning("Agent Task Bridge post_tool_call observer failed", exc_info=True)
 
 
 def _before_llm(
@@ -488,9 +374,9 @@ def _before_llm(
 ) -> dict[str, str] | None:
     try:
         state = _state()
-        # message_agent 的 notify_on_complete 會以合成 user turn 回到派工者。
-        # 先依 process ID 收斂狀態，且不要把通知 output 中可能出現的 task
-        # marker 誤綁成 Controller 自己的 worker turn。
+        # 背景 terminal 的完成通知會以合成 user turn 回到派工者。先依 process
+        # ID 收斂狀態，且不要把 output 內的 task marker 誤綁成 Controller 自己
+        # 的 worker turn。
         if _observe_process_completion(state, user_message):
             return None
         task_id = extract_task_id(user_message)
@@ -500,9 +386,13 @@ def _before_llm(
         task = state.task(task_id)
         if task is None:
             return None
+        worker_profile = _current_profile()
+        if task.target != worker_profile:
+            # marker 不是授權；只有任務指定的 profile 可以接手這個 worker turn。
+            return None
         bound = state.bind_worker(
             task_id,
-            worker_profile=_current_profile(),
+            worker_profile=worker_profile,
             worker_session_id=str(session_id or ""),
             worker_turn_id=str(turn_id or ""),
         )
@@ -511,7 +401,7 @@ def _before_llm(
         kick_native_outbox(state)
         return {
             "context": (
-                f"這是 Telegram Canonical Bridge 追蹤任務 {task_id}。"
+                f"這是 Agent Task Bridge 追蹤任務 {task_id}。"
                 "只在有可驗證的新進展時呼叫 bridge_task_update；不要回報內部思考。"
                 "開始時、長時間操作前後、以及送出最終答覆前，呼叫 "
                 f"bridge_task_inbox(task_id=\"{task_id}\") 檢查使用者留言。"
@@ -520,11 +410,11 @@ def _before_llm(
                 "可公開的最終里程碑，"
                 "再照常回覆 Controller；bridge 會由 post_llm_call 與背景程序狀態判定完成，"
                 "不需自行宣稱 completed。若漏掉明確里程碑，bridge 只會把清理後的最終答覆"
-                "摘要留在 Telegram 任務時間線，不會保存內部思考或原始工具資料。"
+                "摘要留在原生訊息平台的任務時間線，不會保存內部思考或原始工具資料。"
             )
         }
     except Exception:
-        logger.warning("Telegram canonical bridge pre_llm_call failed open", exc_info=True)
+        logger.warning("Agent Task Bridge pre_llm_call failed open", exc_info=True)
         return None
 
 
@@ -543,7 +433,7 @@ def _after_llm(
         )
         kick_native_outbox(state)
     except Exception:
-        logger.warning("Telegram canonical bridge post_llm_call observer failed", exc_info=True)
+        logger.warning("Agent Task Bridge post_llm_call observer failed", exc_info=True)
 
 
 def _on_session_end(
@@ -567,7 +457,7 @@ def _on_session_end(
                 state,
                 task.id,
                 status="failed",
-                progress="OT turn 在產生最終回覆前失敗。",
+                progress="Bot turn 在產生最終回覆前失敗。",
                 evidence="hook:on_session_end failed",
                 last_error=reason or "worker turn failed",
             )
@@ -576,12 +466,12 @@ def _on_session_end(
                 state,
                 task.id,
                 status="blocked",
-                progress="OT turn 被中斷；任務可能需要重新派送。",
+                progress="Bot turn 被中斷；任務可能需要重新派送。",
                 evidence="hook:on_session_end interrupted",
                 last_error=reason,
             )
     except Exception:
-        logger.warning("Telegram canonical bridge session-end observer failed", exc_info=True)
+        logger.warning("Agent Task Bridge session-end observer failed", exc_info=True)
 
 
 def _authorized_worker_task(
@@ -592,7 +482,7 @@ def _authorized_worker_task(
         return None, "找不到 task。"
     bound = state.task_for_worker(str(session_id or ""))
     if bound is None or bound.id != task.id:
-        return None, "這個 Hermes session 不是該 task 的已綁定 OT turn。"
+        return None, "這個 Hermes session 不是該 task 的已綁定 Bot turn。"
     return task, None
 
 
@@ -618,16 +508,16 @@ def bridge_task_update(args: dict[str, Any], **kwargs: Any) -> str:
         status=mapped,
         progress=message,
         evidence=(
-            "OT explicit bridge_task_result"
+            "Bot explicit bridge_task_result"
             if requested == "result"
-            else "OT explicit bridge_task_update"
+            else "Bot explicit bridge_task_update"
         ),
     )
     return _json({
         "ok": updated is not None,
         "task_id": task.id,
         "status": updated.status if updated else task.status,
-        "message": "Telegram 任務進度已排入時間線。",
+        "message": "任務進度已排入原生訊息平台時間線。",
     })
 
 
@@ -674,7 +564,7 @@ def bridge_task_status(args: dict[str, Any], **_: Any) -> str:
 
 
 def register_task_features(ctx: Any) -> None:
-    """由 root plugin 與 deferred platform tools.py 共用的註冊入口。"""
+    """註冊 worker 狀態工具與任務生命週期 hooks。"""
 
     ctx.register_tool(
         name="bridge_task_update",
@@ -682,7 +572,7 @@ def register_task_features(ctx: Any) -> None:
         schema={
             "name": "bridge_task_update",
             "description": (
-                "Update a Telegram-tracked message_agent task only when a meaningful, "
+                "Update a tracked Agent Task only when a meaningful, "
                 "verifiable milestone changed. Never report private reasoning."
             ),
             "parameters": {
@@ -703,7 +593,7 @@ def register_task_features(ctx: Any) -> None:
             },
         },
         handler=bridge_task_update,
-        description="回報可驗證的 OT 任務進度",
+        description="回報可驗證的 Bot 任務進度",
         emoji="🧭",
     )
     ctx.register_tool(
@@ -712,7 +602,7 @@ def register_task_features(ctx: Any) -> None:
         schema={
             "name": "bridge_task_inbox",
             "description": (
-                "Read follow-up messages attached by the Telegram user to this tracked task. "
+                "Read follow-up messages attached by the controller to this tracked task. "
                 "Check at natural milestones and before the final response."
             ),
             "parameters": {
@@ -725,7 +615,7 @@ def register_task_features(ctx: Any) -> None:
             },
         },
         handler=bridge_task_inbox,
-        description="讀取 Telegram 使用者的任務留言",
+        description="讀取主 Agent 的任務留言",
         emoji="📥",
     )
     ctx.register_tool(
@@ -733,7 +623,7 @@ def register_task_features(ctx: Any) -> None:
         toolset=TOOLSET_NAME,
         schema={
             "name": "bridge_task_status",
-            "description": "Read evidence-backed status for one or recent Telegram bridge tasks.",
+            "description": "Read evidence-backed status for one or recent Agent Task Bridge tasks.",
             "parameters": {
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},
@@ -741,7 +631,7 @@ def register_task_features(ctx: Any) -> None:
             },
         },
         handler=bridge_task_status,
-        description="查詢 message_agent 任務 ledger",
+        description="查詢 Agent Task Bridge ledger",
         emoji="📋",
     )
     ctx.register_hook("pre_tool_call", _before_tool)

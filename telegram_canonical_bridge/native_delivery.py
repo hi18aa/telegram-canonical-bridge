@@ -12,24 +12,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from contextlib import suppress
 from pathlib import Path
 
 from .state import BridgeState
 
 
-NATIVE_ROUTE_PREFIX = "native:"
 LOCAL_DELIVERY_TARGET = "local"
-
-
-def native_route(delivery_target: str) -> str:
-    return f"{NATIVE_ROUTE_PREFIX}{str(delivery_target or LOCAL_DELIVERY_TARGET).strip()}"
-
-
-def delivery_target_from_route(route: str) -> str:
-    value = str(route or "")
-    return value[len(NATIVE_ROUTE_PREFIX):] if value.startswith(NATIVE_ROUTE_PREFIX) else ""
 
 
 def _hermes_executable() -> str:
@@ -83,19 +72,19 @@ def flush_native_outbox(state: BridgeState, *, limit: int = 8) -> dict[str, int]
     sent = failed = 0
     remaining = max(0, int(limit))
     while remaining:
-        # ``claim_due_native_outbox`` 會刻意只領取每個 task 最早的一筆，
+        # ``claim_due_outbox`` 會刻意只領取每個 task 最早的一筆，
         # 以保證時間線順序。每成功送出一批後必須重新 claim，否則同一個
         # 快速任務的 result／completed 會留到下一個 hook 才有機會送出。
-        records = state.claim_due_native_outbox(limit=remaining)
+        records = state.claim_due_outbox(limit=remaining)
         if not records:
             break
         remaining -= len(records)
         for record in records:
-            target = delivery_target_from_route(record.chat_id)
-            task = state.task(record.task_id or "") if record.task_id else None
+            target = record.delivery_target
+            task = state.task(record.task_id)
             profile = task.origin_profile if task is not None else "default"
-            if not target or target == LOCAL_DELIVERY_TARGET:
-                state.mark_outbox_sent(record.id, f"local-{record.id}")
+            if target == LOCAL_DELIVERY_TARGET:
+                state.mark_outbox_sent(record.id)
                 sent += 1
                 continue
             ok, detail = _send_text(
@@ -105,7 +94,7 @@ def flush_native_outbox(state: BridgeState, *, limit: int = 8) -> dict[str, int]
                 spool_dir=state.path.parent / "delivery-spool",
             )
             if ok:
-                state.mark_outbox_sent(record.id, f"native-{record.id}-{int(time.time())}")
+                state.mark_outbox_sent(record.id)
                 sent += 1
                 continue
             delay = min(300.0, 5.0 * (2 ** min(record.attempts, 6)))
@@ -121,10 +110,10 @@ def kick_native_outbox(state: BridgeState) -> bool:
     runner 會持續處理 retry 時間，避免最後一筆 completion 因暫時失敗永遠卡住。
     """
 
-    routes = state.pending_native_routes()
-    if not routes:
+    targets = state.pending_delivery_targets()
+    if not targets:
         return False
-    if all(delivery_target_from_route(route) == LOCAL_DELIVERY_TARGET for route in routes):
+    if targets == {LOCAL_DELIVERY_TARGET}:
         flush_native_outbox(state, limit=32)
         return True
 

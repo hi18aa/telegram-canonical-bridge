@@ -1,13 +1,10 @@
-"""Telegram Canonical Bridge 的核心模組。"""
+"""Hermes Agent Task Bridge 的核心模組。"""
 
-from .config import BridgeConfig, BridgeConfigurationError, hermes_machine_root
-from .service import CanonicalBridgeService
+from .config import hermes_machine_root, shared_state_path
 from .state import BridgeState
 
 __all__ = [
-    "BridgeConfig",
-    "BridgeConfigurationError",
     "BridgeState",
-    "CanonicalBridgeService",
     "hermes_machine_root",
+    "shared_state_path",
 ]

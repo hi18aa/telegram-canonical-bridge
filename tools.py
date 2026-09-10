@@ -1,4 +1,4 @@
-"""平台外掛的 eager tools/hooks 入口。"""
+"""一般 Hermes plugin 的 tools/hooks 註冊入口。"""
 
 from __future__ import annotations
 

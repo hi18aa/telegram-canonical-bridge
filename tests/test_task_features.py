@@ -1,299 +1,248 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from telegram_canonical_bridge.config import STATE_PATH_ENV
+from telegram_canonical_bridge import agent_tasks, task_features
 from telegram_canonical_bridge.state import BridgeState
-from telegram_canonical_bridge.task_features import (
-    _after_llm,
-    _after_tool,
-    _before_llm,
-    _before_tool,
-    _parse_process_completion,
-    bridge_task_inbox,
-    bridge_task_update,
-)
-from telegram_canonical_bridge.task_model import extract_task_id
+from telegram_canonical_bridge.task_model import task_marker
 
 
 class TaskFeatureTests(unittest.TestCase):
-    def _create_dispatched_task(self, state: BridgeState, *, process_id: str) -> str:
-        state.bind_active_route(
-            controller_profile="default", chat_id="chat-1", user_id="user-1"
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = BridgeState(Path(self.temp.name) / "tasks.sqlite3")
+        self.patches = [
+            patch.object(task_features, "_state", return_value=self.state),
+            patch.object(task_features, "kick_native_outbox", return_value=True),
+        ]
+        for active in self.patches:
+            active.start()
+        self.original_settings = agent_tasks._SETTINGS
+        agent_tasks._SETTINGS = agent_tasks.AgentTaskSettings(delivery_target="local")
+        self.call_number = 0
+
+    def tearDown(self) -> None:
+        agent_tasks._SETTINGS = self.original_settings
+        for active in reversed(self.patches):
+            active.stop()
+        self.temp.cleanup()
+
+    def _dispatched(self, *, process_id: str = "proc-test"):
+        self.call_number += 1
+        task, _ = self.state.create_task(
+            delivery_target="local",
+            origin_profile="default",
+            origin_session_id=f"controller-session-{self.call_number}",
+            origin_turn_id=f"controller-turn-{self.call_number}",
+            origin_tool_call_id=f"controller-call-{self.call_number}",
+            target="operitrace-agent",
+            queue_outbox=False,
         )
-        state.set_canonical_binding(
-            controller_profile="default",
-            root_id="controller-root",
-            runtime_id="controller-session",
+        return self.state.transition_task(
+            task.id,
+            status="dispatched",
+            process_id=process_id,
+            progress="runner ready",
+            evidence="agent_task_start background acknowledgement",
         )
-        directive = _before_tool(
+
+    def test_message_agent_is_never_wrapped_or_modified(self) -> None:
+        before = len(self.state.list_tasks())
+        result = task_features._before_tool(
             "message_agent",
-            {"target": "operitrace-agent", "message": "診斷任務"},
-            session_id="controller-session",
-            tool_call_id=f"tool-{process_id}",
-            turn_id="controller-turn",
+            {"target": "worker", "message": "原始內容"},
+            session_id="session",
+            tool_call_id="call",
+            turn_id="turn",
         )
-        task_id = extract_task_id(directive["args"]["message"])
-        _after_tool(
-            "message_agent",
-            json.dumps({"status": "sent", "process_id": process_id}),
-            session_id="controller-session",
-            tool_call_id=f"tool-{process_id}",
-            turn_id="controller-turn",
-            status="success",
+        self.assertIsNone(result)
+        self.assertEqual(len(self.state.list_tasks()), before)
+
+    def test_agent_task_start_pre_hook_creates_only_an_idempotent_intent(self) -> None:
+        with patch.object(task_features, "_current_profile", return_value="default"):
+            first = task_features._before_tool(
+                "agent_task_start",
+                {"target": "operitrace-agent", "message": "診斷任務"},
+                session_id="controller-session",
+                tool_call_id="same-call",
+                turn_id="controller-turn",
+            )
+            second = task_features._before_tool(
+                "agent_task_start",
+                {"target": "operitrace-agent", "message": "診斷任務"},
+                session_id="controller-session",
+                tool_call_id="same-call",
+                turn_id="controller-turn",
+            )
+        self.assertEqual(first["action"], "modify")
+        self.assertEqual(first["args"], second["args"])
+        self.assertEqual(set(first["args"]), {"_bridge_task_id"})
+        self.assertEqual(len(self.state.list_tasks()), 1)
+
+    def test_only_target_profile_can_bind_worker_turn(self) -> None:
+        task = self._dispatched()
+        payload = f"{task_marker(task.id)}\n請執行安全測試"
+        with patch.object(task_features, "_current_profile", return_value="default"):
+            self.assertIsNone(task_features._before_llm(
+                session_id="wrong-session",
+                turn_id="wrong-turn",
+                user_message=payload,
+            ))
+        self.assertIsNone(self.state.task(task.id).worker_session_id)
+
+        with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
+            context = task_features._before_llm(
+                session_id="worker-session",
+                turn_id="worker-turn",
+                user_message=payload,
+            )
+        self.assertIn(task.id, context["context"])
+        self.assertEqual(self.state.task(task.id).worker_session_id, "worker-session")
+
+    def test_worker_progress_inbox_and_final_result_form_a_closed_loop(self) -> None:
+        task = self._dispatched(process_id="proc-closed-loop")
+        with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
+            task_features._before_llm(
+                session_id="worker-session",
+                turn_id="worker-turn",
+                user_message=f"{task_marker(task.id)}\n請檢查",
+            )
+        progress = json.loads(task_features.bridge_task_update(
+            {
+                "task_id": task.id,
+                "status": "working",
+                "message": "已啟動瀏覽器工具，正在讀取公開頁面。",
+            },
+            session_id="worker-session",
+        ))
+        self.assertTrue(progress["ok"])
+        self.assertEqual(
+            self.state.task(task.id).evidence, "Bot explicit bridge_task_update"
         )
-        return task_id
 
-    def test_native_message_agent_is_wrapped_and_worker_can_report(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                state.bind_active_route(
-                    controller_profile="default", chat_id="chat-1", user_id="user-1"
-                )
-                state.set_canonical_binding(
-                    controller_profile="default",
-                    root_id="controller-root",
-                    runtime_id="controller-session",
-                )
+        self.state.add_agent_task_note(
+            task_id=task.id,
+            origin_profile="default",
+            text="不要登入",
+            note_id="note-1",
+        )
+        inbox = json.loads(task_features.bridge_task_inbox(
+            {"task_id": task.id, "acknowledge": True},
+            session_id="worker-session",
+        ))
+        self.assertEqual([item["text"] for item in inbox["messages"]], ["不要登入"])
 
-                directive = _before_tool(
-                    "message_agent",
-                    {"target": "operitrace-agent", "message": "請執行測試"},
-                    session_id="controller-session",
-                    tool_call_id="tool-call-1",
-                    turn_id="controller-turn",
-                )
-                self.assertEqual(directive["action"], "modify")
-                tracked_message = directive["args"]["message"]
-                task_id = extract_task_id(tracked_message)
-                self.assertTrue(task_id)
-                self.assertIn("請執行測試", tracked_message)
+        result = json.loads(task_features.bridge_task_update(
+            {
+                "task_id": task.id,
+                "status": "result",
+                "message": "公開頁面檢查完成，未登入也未修改資料。",
+            },
+            session_id="worker-session",
+        ))
+        self.assertTrue(result["ok"])
+        task_features._after_llm(
+            session_id="worker-session",
+            turn_id="worker-turn",
+            assistant_response="fallback response",
+        )
+        returning = self.state.task(task.id)
+        self.assertEqual(returning.status, "returning")
+        self.assertEqual(returning.progress, "公開頁面檢查完成，未登入也未修改資料。")
 
-                _after_tool(
-                    "message_agent",
-                    json.dumps({"status": "sent", "process_id": "process-1"}),
-                    session_id="controller-session",
-                    tool_call_id="tool-call-1",
-                    turn_id="controller-turn",
-                    status="success",
-                )
-                self.assertEqual(state.task(task_id).process_id, "process-1")
+        notification = (
+            "[IMPORTANT: Background process proc-closed-loop completed normally (exit code 0).\n"
+            "Command: hidden\nOutput:\nworker final]"
+        )
+        with patch.object(task_features, "_current_profile", return_value="default"):
+            self.assertIsNone(task_features._before_llm(
+                session_id=task.origin_session_id,
+                turn_id="completion-turn",
+                user_message=notification,
+            ))
+        completed = self.state.task(task.id)
+        self.assertEqual(completed.status, "completed")
+        self.assertEqual(completed.exit_code, 0)
 
-                context = _before_llm(
-                    session_id="worker-session",
-                    turn_id="worker-turn",
-                    user_message=f"Message from Controller: {tracked_message}",
-                )
-                self.assertIn(task_id, context["context"])
-                self.assertEqual(state.task(task_id).worker_session_id, "worker-session")
+    def test_explicit_progress_is_not_overwritten_by_generic_tool_activity(self) -> None:
+        task = self._dispatched()
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="worker-session",
+            worker_turn_id="worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="running",
+            progress="具體里程碑",
+            evidence="Bot explicit bridge_task_update",
+        )
+        task_features._before_tool(
+            "terminal",
+            {"command": "ignored"},
+            session_id="worker-session",
+            tool_call_id="tool-call",
+            turn_id="worker-turn",
+        )
+        self.assertEqual(self.state.task(task.id).progress, "具體里程碑")
 
-                update = json.loads(bridge_task_update(
-                    {
-                        "task_id": task_id,
-                        "status": "result",
-                        "message": "瀏覽器已透過工具成功開啟，正在檢查頁面。",
-                    },
-                    session_id="worker-session",
-                ))
-                self.assertTrue(update["ok"])
-                self.assertIn("瀏覽器", state.task(task_id).progress)
+    def test_typed_process_failure_is_reported_without_command_output(self) -> None:
+        task = self._dispatched(process_id="proc-failed")
+        notification = (
+            "[IMPORTANT: Background process proc-failed exited (exit code 1).\n"
+            "Command: SECRET COMMAND\nOutput:\n"
+            '{"error":"provider denied","reason":"provider_auth_or_access"}]'
+        )
+        parsed = task_features._parse_process_completion(notification)
+        self.assertEqual(parsed.process_id, "proc-failed")
+        with patch.object(task_features, "_current_profile", return_value="default"):
+            task_features._before_llm(
+                session_id=task.origin_session_id,
+                turn_id="completion-turn",
+                user_message=notification,
+            )
+        failed = self.state.task(task.id)
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("provider", failed.progress)
+        self.assertNotIn("SECRET COMMAND", failed.progress)
 
-                _before_tool(
-                    "terminal",
-                    {"command": "close browser"},
-                    session_id="worker-session",
-                    tool_call_id="tool-after-explicit-update",
-                    turn_id="worker-turn",
-                )
-                self.assertIn("成功開啟", state.task(task_id).progress)
+    def test_hookless_final_output_can_complete_task(self) -> None:
+        task = self._dispatched(process_id="proc-hookless")
+        notification = (
+            "[IMPORTANT: Background process proc-hookless completed normally (exit code 0).\n"
+            "Command: hidden\nOutput:\n"
+            f"{task_marker(task.id)} 公開檢查已完成。]"
+        )
+        task_features._before_llm(
+            session_id=task.origin_session_id,
+            turn_id="completion-turn",
+            user_message=notification,
+        )
+        completed = self.state.task(task.id)
+        self.assertEqual(completed.status, "completed")
+        self.assertIn("公開檢查已完成", completed.progress)
+        self.assertNotIn("TCB-TASK", completed.progress)
+        self.assertIsNone(completed.worker_session_id)
 
-                state.add_task_note(
-                    task_id=task_id,
-                    chat_id="chat-1",
-                    user_id="user-1",
-                    telegram_message_id="note-1",
-                    text="請再確認登入帳號",
-                )
-                inbox = json.loads(bridge_task_inbox(
-                    {"task_id": task_id, "acknowledge": True},
-                    session_id="worker-session",
-                ))
-                self.assertEqual(
-                    [message["text"] for message in inbox["messages"]],
-                    ["請再確認登入帳號"],
-                )
-                self.assertEqual(state.task(task_id).pending_notes, 0)
-
-                _after_llm(
-                    session_id="worker-session",
-                    turn_id="worker-turn",
-                    assistant_response="這段 fallback 不應覆寫 OT 的明確里程碑。",
-                )
-                self.assertEqual(state.task(task_id).status, "returning")
-                self.assertIn("成功開啟", state.task(task_id).progress)
-                self.assertNotIn("fallback", state.task(task_id).progress)
-
-    def test_without_active_telegram_route_message_agent_is_untouched(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                self.assertIsNone(_before_tool(
-                    "message_agent",
-                    {"target": "worker", "message": "原始內容"},
-                    session_id="session",
-                    tool_call_id="call",
-                    turn_id="turn",
-                ))
-
-    def test_unrelated_session_is_not_tracked_even_when_a_route_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                state.bind_active_route(
-                    controller_profile="default", chat_id="chat-1", user_id="user-1"
-                )
-                state.set_canonical_binding(
-                    controller_profile="default",
-                    root_id="controller-root",
-                    runtime_id="controller-session",
-                )
-
-                self.assertIsNone(_before_tool(
-                    "message_agent",
-                    {"target": "worker", "message": "不屬於 Telegram 的派工"},
-                    session_id="unrelated-session",
-                    tool_call_id="unrelated-call",
-                    turn_id="unrelated-turn",
-                ))
-                self.assertEqual(state.list_tasks(), [])
-
-    def test_background_completion_failure_exposes_typed_runner_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                task_id = self._create_dispatched_task(state, process_id="proc-failed")
-                notification = (
-                    "[IMPORTANT: Background process proc-failed exited (exit code 1).\n"
-                    "Command: hidden\nOutput:\n"
-                    '{"error":"Session has a live owner","reason":"target_busy"}]'
-                )
-
-                self.assertIsNone(_before_llm(
-                    session_id="controller-session",
-                    turn_id="completion-turn",
-                    user_message=notification,
-                ))
-                failed = state.task(task_id)
-                self.assertEqual(failed.status, "failed")
-                self.assertEqual(failed.exit_code, 1)
-                self.assertIn("Bot Chat", failed.progress)
-                self.assertIsNone(failed.worker_session_id)
-
-    def test_live_delivery_ack_waits_for_real_worker_start(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                task_id = self._create_dispatched_task(state, process_id="proc-queued")
-                task = state.task(task_id)
-                tracked = f"[TCB-TASK:{task_id}]\n請只回覆完成"
-                notification = (
-                    "[IMPORTANT: Background process proc-queued completed normally (exit code 0).\n"
-                    "Command: hidden\nOutput:\n"
-                    "Delivered into @operitrace-agent's open Bot Chat; "
-                    "the reply will appear there.]"
-                )
-
-                self.assertIsNone(_before_llm(
-                    session_id="controller-session",
-                    turn_id="completion-turn",
-                    user_message=notification,
-                ))
-                queued = state.task(task_id)
-                self.assertEqual(queued.status, "waiting")
-                self.assertIn("收件回條", queued.progress)
-                self.assertFalse(queued.terminal)
-
-                context = _before_llm(
-                    session_id="worker-session",
-                    turn_id="worker-turn",
-                    user_message=tracked,
-                )
-                self.assertIn(task_id, context["context"])
-                self.assertEqual(state.task(task_id).status, "running")
-
-    def test_completion_reply_can_close_remote_or_hookless_worker(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                task_id = self._create_dispatched_task(state, process_id="proc-remote")
-                notification = (
-                    "[IMPORTANT: Background process proc-remote completed normally (exit code 0).\n"
-                    "Command: hidden\nOutput:\n"
-                    "Reply from @operitrace-agent on peer 'office':\n"
-                    f"[TCB-TASK:{task_id}] 跨機器任務已完成。]"
-                )
-
-                parsed = _parse_process_completion(notification)
-                self.assertEqual(parsed.process_id, "proc-remote")
-                self.assertEqual(parsed.exit_code, 0)
-                self.assertIsNone(_before_llm(
-                    session_id="controller-session",
-                    turn_id="completion-turn",
-                    user_message=notification,
-                ))
-                completed = state.task(task_id)
-                self.assertEqual(completed.status, "completed")
-                self.assertEqual(completed.exit_code, 0)
-                self.assertIn("跨機器任務已完成", completed.progress)
-                self.assertNotIn("TCB-TASK", completed.progress)
-                # 完成通知 output 即使含 marker，也不能把 Controller 誤綁成 OT。
-                self.assertIsNone(completed.worker_session_id)
-
-    def test_queued_ack_without_process_handle_stays_honestly_waiting(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bridge.sqlite3"
-            with patch.dict(os.environ, {STATE_PATH_ENV: str(path)}):
-                state = BridgeState(path)
-                state.bind_active_route(
-                    controller_profile="default", chat_id="chat-1", user_id="user-1"
-                )
-                state.set_canonical_binding(
-                    controller_profile="default",
-                    root_id="controller-root",
-                    runtime_id="controller-session",
-                )
-                directive = _before_tool(
-                    "message_agent",
-                    {"target": "operitrace-agent", "message": "新版收件測試"},
-                    session_id="controller-session",
-                    tool_call_id="tool-queued-no-process",
-                    turn_id="controller-turn",
-                )
-                task_id = extract_task_id(directive["args"]["message"])
-
-                _after_tool(
-                    "message_agent",
-                    json.dumps({"status": "queued", "delivery_id": "delivery-1"}),
-                    session_id="controller-session",
-                    tool_call_id="tool-queued-no-process",
-                    turn_id="controller-turn",
-                    status="success",
-                )
-                task = state.task(task_id)
-                self.assertEqual(task.status, "waiting")
-                self.assertIsNone(task.process_id)
-                self.assertIn("尚未觀察 OT turn", task.progress)
+    def test_empty_success_without_final_evidence_is_unconfirmed(self) -> None:
+        task = self._dispatched(process_id="proc-empty")
+        notification = (
+            "[IMPORTANT: Background process proc-empty completed normally (exit code 0).\n"
+            "Command: hidden\nOutput:\n(empty reply)]"
+        )
+        task_features._before_llm(
+            session_id=task.origin_session_id,
+            turn_id="completion-turn",
+            user_message=notification,
+        )
+        uncertain = self.state.task(task.id)
+        self.assertEqual(uncertain.status, "unconfirmed")
+        self.assertIn("無法宣稱任務完成", uncertain.progress)
 
 
 if __name__ == "__main__":

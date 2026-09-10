@@ -1,8 +1,8 @@
 """一般 Hermes session 可用的專門 Bot 派工 sidecar。
 
 此模組不取代 Telegram adapter，也不覆寫核心 ``message_agent``。主 Agent
-透過外掛工具建立可追蹤任務，runner 再使用 Hermes 公開 CLI 把工作送進目標
-profile 唯一的 canonical ``Bot Chat``。
+透過外掛工具建立可追蹤任務，runner 再使用 Hermes 公開 CLI，為每個 task
+建立一個隔離 conversation 並真正執行目標 Bot turn。
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import hermes_machine_root, shared_state_path
-from .native_delivery import kick_native_outbox, native_route
+from .native_delivery import kick_native_outbox
 from .task_model import TASK_STATUS_LABELS, normalize_task_id, sanitize_progress, task_marker
 
 
@@ -208,7 +208,7 @@ def prepare_start(
     if parent is not None and parent.terminal:
         parent = None
     task, _created = state.create_task(
-        chat_id=native_route(_SETTINGS.delivery_target),
+        delivery_target=_SETTINGS.delivery_target,
         origin_profile=origin_profile,
         origin_session_id=str(session_id or ""),
         origin_turn_id=str(turn_id or ""),
@@ -300,7 +300,7 @@ def _write_message(task: Any, message: str, attachments: list[Path]) -> Path:
     return path
 
 
-def _runner_command(target: str, message_file: Path) -> str:
+def _runner_command(target: str, task_id: str, message_file: Path) -> str:
     runner = Path(__file__).resolve().with_name("agent_task_runner.py")
     hermes = shutil.which("hermes") or "hermes"
     argv = [
@@ -308,6 +308,8 @@ def _runner_command(target: str, message_file: Path) -> str:
         str(runner),
         "--target",
         target,
+        "--task-id",
+        task_id,
         "--message-file",
         str(message_file),
         "--lock-root",
@@ -332,9 +334,9 @@ def _task_for_start(state: Any, args: dict[str, Any], profile: str, session_id: 
         and task.target == target
     ):
         return task
-    # Direct registry tests or older Hermes hosts may omit pre_tool_call identity.
+    # Plugin Doctor 或直接 registry 呼叫可能沒有 pre_tool_call identity。
     task, _created = state.create_task(
-        chat_id=native_route(_SETTINGS.delivery_target),
+        delivery_target=_SETTINGS.delivery_target,
         origin_profile=profile,
         origin_session_id=session_id,
         origin_turn_id="",
@@ -400,7 +402,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
         raw = _CTX.dispatch_tool(
             "terminal",
             {
-                "command": _runner_command(target, message_file),
+                "command": _runner_command(target, task.id, message_file),
                 "background": True,
                 "notify": True,
                 "workdir": str(shared_state_path().parent),
@@ -422,7 +424,10 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             task.id,
             status="dispatched",
             process_id=process_id,
-            progress="Hermes 已建立背景 runner；等待目標 Bot turn 的啟動證據。",
+            progress=(
+                f"Hermes 已建立背景 runner；等待隔離對話「TCB Task {task.id}」"
+                "的 Bot turn 啟動證據。"
+            ),
             evidence="agent_task_start background acknowledgement",
         )
         kick_native_outbox(state)
@@ -433,7 +438,8 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             "target": target,
             "process_id": process_id,
             "detail": (
-                "背景 runner 已建立；這不代表 Bot 已完成。請把 task_id 告知使用者並結束本 turn，"
+                "背景 runner 已建立；這不代表 Bot 已完成。每個 task 使用獨立對話，"
+                "請把 task_id 告知使用者並結束本 turn，"
                 "完成通知會喚醒同一個來源 session。"
             ),
             "task": _task_payload(updated or task),
@@ -632,7 +638,7 @@ def register_agent_tasks(ctx: Any) -> None:
         schema={
             "name": "agent_task_start",
             "description": (
-                "把符合 roster 分工的工作非同步派給專門 Bot。使用 Hermes 原生 canonical Bot Chat，"
+                "把符合 roster 分工的工作非同步派給專門 Bot。每個 task 使用隔離 conversation，"
                 "回傳 sent 只代表 runner 已建立，不代表工作完成。"
             ),
             "parameters": {

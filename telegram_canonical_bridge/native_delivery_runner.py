@@ -84,7 +84,7 @@ def run(argv: list[str] | None = None) -> int:
         with _DeliveryLock(lock_path):
             while time.monotonic() < deadline:
                 flush_native_outbox(state, limit=32)
-                wait = state.next_native_outbox_wait()
+                wait = state.next_outbox_wait()
                 if wait is None:
                     idle_since = idle_since or time.monotonic()
                     if time.monotonic() - idle_since >= max(0.0, float(args.idle_grace)):

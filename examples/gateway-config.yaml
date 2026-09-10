@@ -1,5 +1,6 @@
-# 合併到 Controller 的 <HERMES_HOME>/config.yaml。
-# Telegram token、allowlist 與 home channel 仍由 `hermes gateway setup` 管理。
+# 這是要合併到 Controller <HERMES_HOME>/config.yaml 的片段，不是完整設定檔。
+# Telegram token、allowlist、home channel 與 platforms.telegram 仍由
+# `hermes gateway setup` 建立及管理。
 
 plugins:
   enabled:
@@ -8,44 +9,31 @@ plugins:
     telegram-canonical-bridge:
       allow_tool_override: false
       settings:
-        # 使用 Hermes 原生 Telegram home channel 傳送任務時間線。
+        # 使用 Hermes 原生 Telegram home channel 傳送不可變任務事件。
         # 若要固定 chat，可改為 telegram:<chat_id>。
         delivery_target: telegram
 
-        # 只有列出的主 Agent profiles 可以建立與管理任務。
+        # 只有列出的 Controller profiles 可以建立及管理任務。
         controller_profiles:
           - default
 
-        # 建議明確列出允許的 worker profiles 與責任。
+        # 建議明確列出可派工的本機 worker profiles 與責任。
         agents:
           operitrace-agent:
             role: OperiTrace 網站與瀏覽器操作助手
           research-agent:
             role: 研究與資料查證助手
 
-        # 同一 worker 的工作會序列化；等待前一任務的最長秒數。
+        # 同一個 worker profile 依序執行；這是等候前一任務的最長秒數。
         lock_timeout_seconds: 3600
 
-        # 同機附件是否先複製到共用 plugin-data。
+        # 將同機附件複製到共用 plugin-data，避免來源暫存檔提早消失。
         copy_attachments: true
 
-# Controller 的 Telegram surface 要啟用 plugin toolset；可用 CLI 命令設定：
+# 用 CLI 修改既有 toolset，比直接覆寫整段 platform_toolsets 安全：
 # hermes tools enable telegram_canonical_bridge --platform telegram
-platform_toolsets:
-  telegram:
-    - hermes-telegram
-    - telegram_canonical_bridge
-
-platforms:
-  # 這是 Hermes 原生 Telegram；其餘設定由 gateway setup 產生並保留。
-  telegram:
-    enabled: true
-
-  # v0.4 的自管 adapter 只作相容保留。v0.5 sidecar 模式必須停用，
-  # 避免它與原生 Telegram 同時輪詢同一個 token。
-  telegram_canonical_bridge:
-    enabled: false
-
-# 每個 worker profile 另行安裝／啟用 plugin 與 cli toolset：
-# hermes -p operitrace-agent plugins install https://github.com/hi18aa/telegram-canonical-bridge.git --enable
+# hermes tools enable telegram_canonical_bridge --platform cli
 # hermes -p operitrace-agent tools enable telegram_canonical_bridge --platform cli
+
+# v0.6 不得存在 platforms.telegram_canonical_bridge；若從舊版升級：
+# hermes config unset platforms.telegram_canonical_bridge

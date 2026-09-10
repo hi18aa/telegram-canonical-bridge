@@ -21,7 +21,8 @@ from pathlib import Path
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-_PLUGIN_TOOLSETS = {"agent_tasks", "telegram_canonical_bridge"}
+TASK_ID_RE = re.compile(r"^TCB-[0-9]{8}-[A-F0-9]{6}$", re.IGNORECASE)
+_PLUGIN_TOOLSETS = {"telegram_canonical_bridge"}
 
 
 class TargetBusyError(TimeoutError):
@@ -100,6 +101,7 @@ class _ProfileLock:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--task-id", required=True)
     parser.add_argument("--message-file", required=True)
     parser.add_argument("--lock-root", required=True)
     parser.add_argument("--lock-timeout", type=float, default=3600.0)
@@ -110,12 +112,20 @@ def _parser() -> argparse.ArgumentParser:
 def run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     target = str(args.target).strip()
+    task_id = str(args.task_id).strip().upper()
     # ``hermes chat --in ~`` 會先切換工作目錄；query-file 必須固定為絕對路徑。
     message_file = Path(args.message_file).resolve()
     if not PROFILE_RE.fullmatch(target):
         print(json.dumps({"error": "invalid target profile", "reason": "invalid_target"}))
         return 2
+    if not TASK_ID_RE.fullmatch(task_id):
+        print(json.dumps({"error": "invalid task id", "reason": "invalid_task"}))
+        return 2
     hermes = str(args.hermes or shutil.which("hermes") or "hermes")
+    # 每個任務使用自己的 Hermes conversation。這可避免 Desktop 正開著 canonical
+    # ``Bot Chat`` 時，CLI 只能把訊息排入佇列卻無法真正啟動 Bot turn；也避免不同
+    # Controller 或不同任務共用上下文。
+    conversation = f"TCB Task {task_id}"
     command = [
         hermes,
         "-p",
@@ -124,8 +134,10 @@ def run(argv: list[str] | None = None) -> int:
         "--in",
         "~",
         "-c",
-        "Bot Chat",
+        conversation,
         "--create-if-missing",
+        "--source",
+        "tool",
         "-Q",
         "--query-file",
         str(message_file),
@@ -151,7 +163,7 @@ def run(argv: list[str] | None = None) -> int:
                 stream.flush()
         if completed.returncode != 0 and "already has a live owner" in stderr.lower():
             print(json.dumps({
-                "error": "target Bot Chat is open on another surface",
+                "error": "task conversation is open on another surface",
                 "reason": "target_busy",
             }))
         return int(completed.returncode)
