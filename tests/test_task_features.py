@@ -103,6 +103,17 @@ class TaskFeatureTests(unittest.TestCase):
         self.assertIsNone(injected)
         self.assertEqual(self.state.task(task.id).worker_session_id, "worker-session")
 
+    def test_controller_turn_does_not_append_dynamic_context_to_user_payload(self) -> None:
+        body = "BRIDGE-EXACT\n\n保留兩個空格  與星星 ⭐⭐"
+        with patch.object(task_features, "_current_profile", return_value="default"):
+            injected = task_features._before_llm(
+                session_id="controller-session",
+                turn_id="controller-turn",
+                user_message=body,
+            )
+        self.assertIsNone(injected)
+        self.assertEqual(self.state.list_tasks(), [])
+
     def test_worker_binding_does_not_inject_control_text_after_task_payload(self) -> None:
         task = self._dispatched()
         clean_end = "保留換行、兩個空格  與星星 ⭐⭐"

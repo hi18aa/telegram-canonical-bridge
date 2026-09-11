@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start, system_prompt_section
+from .agent_tasks import AGENT_TASK_TOOL_NAMES, prepare_start
 from .config import shared_state_path
 from .native_delivery import kick_native_outbox
 from .state import BridgeState
@@ -231,8 +231,10 @@ def _before_llm(
             return None
         task_id = extract_task_id(user_message)
         if not task_id:
-            context = system_prompt_section({"profile_name": _current_profile()})
-            return {"context": context} if context else None
+            # Controller 指引已由 register_system_prompt_section 提供。這裡若再回傳
+            # dynamic context，Hermes 會把它接在當次 user message 後方；Controller
+            # 便可能將那段控制文字誤收進 exact_payload。普通 turn 不再注入文字。
+            return None
         task = state.task(task_id)
         if task is None:
             return None
