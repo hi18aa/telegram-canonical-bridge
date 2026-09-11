@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shlex
 import sqlite3
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -37,7 +43,12 @@ class _FakeContext:
 class AgentTaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.state = BridgeState(Path(self.temp.name) / "tasks.sqlite3")
+        self.state_path = Path(self.temp.name) / "tasks.sqlite3"
+        self.state = BridgeState(self.state_path)
+        self.shared_state_patch = patch.object(
+            agent_tasks, "shared_state_path", return_value=self.state_path
+        )
+        self.shared_state_patch.start()
         self.original_settings = agent_tasks._SETTINGS
         self.original_ctx = agent_tasks._CTX
         self.call_number = 0
@@ -45,6 +56,7 @@ class AgentTaskTests(unittest.TestCase):
     def tearDown(self) -> None:
         agent_tasks._SETTINGS = self.original_settings
         agent_tasks._CTX = self.original_ctx
+        self.shared_state_patch.stop()
         self.temp.cleanup()
 
     def _task(
@@ -198,13 +210,96 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(kwargs["session_id"], task.origin_session_id)
         self.assertEqual(self.state.task(task.id).process_id, "proc_test1234")
 
+    def test_exact_payload_is_byte_preserved_separate_and_digest_is_readable(self) -> None:
+        context = _FakeContext()
+        agent_tasks._CTX = context
+        agent_tasks._SETTINGS = agent_tasks.AgentTaskSettings(
+            delivery_target="local", controller_profiles=("default",)
+        )
+        task = self._task(status="dispatching", process_id=None)
+        exact_text = "OT-RC54-TH-REUSE-20260912-002\n\n保留換行、兩個空格  與星星 ⭐⭐"
+        with (
+            patch.object(agent_tasks, "_state_and_profile", return_value=(self.state, "default")),
+            patch.object(
+                agent_tasks,
+                "available_agents",
+                return_value={"operitrace-agent": "網站操作"},
+            ),
+        ):
+            started = json.loads(agent_tasks.agent_task_start(
+                {
+                    "_bridge_task_id": task.id,
+                    "target": "operitrace-agent",
+                    "message": "請依 exact payload 執行零副作用回讀；不要發布。",
+                    "exact_payload": {"kind": "exact_text", "text": exact_text},
+                },
+                session_id=task.origin_session_id,
+            ))
+            status = json.loads(agent_tasks.agent_task_status({"task_id": task.id}))
+
+        self.assertTrue(started["ok"])
+        contract = started["exact_payload"]
+        body = Path(contract["artifact_path"])
+        manifest = Path(contract["manifest_path"])
+        binding = (
+            self.state_path.parent
+            / "exact-payloads"
+            / "bindings"
+            / f"{task.id}.json"
+        )
+        expected = exact_text.encode("utf-8")
+        self.assertEqual(body.read_bytes(), expected)
+        self.assertEqual(contract["byte_length"], len(expected))
+        self.assertEqual(contract["sha256"], hashlib.sha256(expected).hexdigest())
+        self.assertTrue(contract["verified"])
+        self.assertEqual(status["tasks"][0]["exact_payload"]["sha256"], contract["sha256"])
+        self.assertTrue(status["tasks"][0]["exact_payload"]["verified"])
+
+        body_text = body.read_text(encoding="utf-8")
+        manifest_text = manifest.read_text(encoding="utf-8")
+        binding_text = binding.read_text(encoding="utf-8")
+        for forbidden in (
+            task.id,
+            "bridge_task_update",
+            "bridge_task_inbox",
+            "BEGIN",
+            "END",
+        ):
+            self.assertNotIn(forbidden, body_text)
+            self.assertNotIn(forbidden, manifest_text)
+            self.assertNotIn(forbidden, binding_text)
+
+        command = context.calls[0][1]["command"]
+        argv = shlex.split(command)
+        handoff = Path(argv[argv.index("--message-file") + 1]).read_text(encoding="utf-8")
+        self.assertNotIn(exact_text, handoff)
+        payload_line = next(
+            line for line in handoff.splitlines() if line.startswith('{"exact_payload"')
+        )
+        handoff_contract = json.loads(payload_line)["exact_payload"]
+        self.assertEqual(handoff_contract["artifact_path"], contract["artifact_path"])
+        self.assertEqual(handoff_contract["sha256"], contract["sha256"])
+        self.assertLess(handoff.index("bridge_task_inbox"), handoff.index("Controller @default"))
+
+    def test_exact_payload_binding_refuses_different_reentry(self) -> None:
+        task = self._task(status="dispatching", process_id=None)
+        root = self.state_path.parent
+        first = agent_tasks.create_exact_text_payload(
+            root, task.id, {"text": "第一份逐字內容"}
+        )
+        self.assertTrue(first["verified"])
+        with self.assertRaisesRegex(ValueError, "拒絕覆寫"):
+            agent_tasks.create_exact_text_payload(
+                root, task.id, {"text": "不同的逐字內容"}
+            )
+
     def test_runner_uses_unique_task_conversation_instead_of_bot_chat(self) -> None:
         task = self._task()
         task_id = task.id
         message = Path(self.temp.name) / "message.txt"
         message.write_text("safe test", encoding="utf-8")
         completed = Mock(returncode=0, stdout="done", stderr="")
-        with patch.object(agent_task_runner.subprocess, "run", return_value=completed) as run:
+        with patch.object(agent_task_runner, "_run_worker_command", return_value=(completed, False)) as run:
             code = agent_task_runner.run([
                 "--target",
                 "operitrace-agent",
@@ -256,6 +351,132 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(self.state.task(task.id).status, "cancelled")
         self.assertEqual(context.calls[-1][0], "process_manage")
         self.assertEqual(context.calls[-1][1]["session_id"], "proc_test1234")
+
+    def test_cancel_from_other_controller_preserves_stopping_until_confirmation(self) -> None:
+        agent_tasks._CTX = _FakeContext(process_result={"status": "not_found", "error": "unknown handle"})
+        task = self._task()
+        with patch.object(agent_tasks, "_state_and_profile", return_value=(self.state, "default")):
+            result = json.loads(agent_tasks.agent_task_cancel({"task_id": task.id}))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "stopping")
+        self.assertFalse(result["cancellationConfirmed"])
+        for status in ("running", "waiting", "returning", None):
+            updated = self.state.transition_task(task.id, status=status, progress="late worker update", evidence="late hook")
+            self.assertEqual(updated.status, "stopping")
+            self.assertEqual(updated.evidence, "agent_task_cancel requested")
+
+    def test_other_profile_cannot_cancel(self) -> None:
+        task = self._task(profile="controller-two")
+        agent_tasks._CTX = _FakeContext()
+        with patch.object(agent_tasks, "_state_and_profile", return_value=(self.state, "default")):
+            result = json.loads(agent_tasks.agent_task_cancel({"task_id": task.id}))
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.state.task(task.id).status, "dispatched")
+        self.assertEqual(agent_tasks._CTX.calls, [])
+
+    def test_cancel_without_usable_process_response_keeps_durable_request(self) -> None:
+        for response in ([], None, {"status": "unavailable"}):
+            with self.subTest(response=response):
+                task = self._task()
+                agent_tasks._CTX = _FakeContext()
+                agent_tasks._CTX.process_result = response
+                with patch.object(agent_tasks, "_state_and_profile", return_value=(self.state, "default")):
+                    result = json.loads(agent_tasks.agent_task_cancel({"task_id": task.id}))
+                self.assertEqual(result["status"], "stopping")
+                self.assertFalse(result["cancellationConfirmed"])
+
+    def test_slash_cancel_does_not_report_stopping_as_cancelled(self) -> None:
+        with patch.object(agent_tasks, "agent_task_cancel", return_value=json.dumps({
+            "ok": True, "task_id": "TCB-20260911-ABC123", "status": "stopping",
+            "cancellationConfirmed": False,
+        })):
+            rendered = agent_tasks._slash_command("cancel TCB-20260911-ABC123")
+        self.assertIn("已提出取消要求", rendered)
+        self.assertNotIn("已取消", rendered)
+
+    def test_cancel_before_worker_start_does_not_spawn(self) -> None:
+        task = self._task()
+        self.state.transition_task(task.id, status="stopping", evidence="cancel requested")
+        message = Path(self.temp.name) / "cancelled-message.txt"
+        message.write_text("do not run", encoding="utf-8")
+        with patch.object(agent_task_runner, "_run_worker_command") as run_worker:
+            result = agent_task_runner.run([
+                "--target", task.target, "--task-id", task.id, "--state", str(self.state.path),
+                "--message-file", str(message), "--lock-root", str(Path(self.temp.name) / "locks"),
+            ])
+        run_worker.assert_not_called()
+        self.assertEqual(result, 130)
+        self.assertEqual(self.state.task(task.id).status, "cancelled")
+        self.assertFalse(message.exists())
+
+    def test_runner_stops_real_owned_child_after_other_controller_cancel(self) -> None:
+        task = self._task()
+        agent_tasks._CTX = _FakeContext(process_result={"status": "not_found"})
+        command = [sys.executable, "-c", "import time; time.sleep(30)"]
+        launched = threading.Event()
+        children, results, errors = [], [], []
+        real_popen = subprocess.Popen
+
+        def launch(args, **kwargs):
+            child = real_popen(args, **kwargs)
+            if args == command:
+                children.append(child)
+                launched.set()
+            return child
+
+        def run_worker():
+            try:
+                results.append(agent_task_runner._run_worker_command(command, state=self.state, task_id=task.id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def stop_owned(process):
+            process.kill()
+            process.wait(timeout=5)
+
+        # CI／sandbox 可能禁止 taskkill，即使 child 是本測試建立。此測試要驗證
+        # runner 觀察 durable stopping 後確實停止「自己持有的真實 child」；
+        # Windows /T /F 的命令契約由下一個獨立測試覆蓋。
+        with (
+            patch.object(agent_task_runner.subprocess, "Popen", side_effect=launch),
+            patch.object(agent_task_runner, "_stop_owned_process_tree", side_effect=stop_owned),
+        ):
+            thread = threading.Thread(target=run_worker, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(launched.wait(5), "真實 child 未啟動")
+                other_connection = BridgeState(self.state.path)
+                with patch.object(agent_tasks, "_state_and_profile", return_value=(other_connection, "default")):
+                    requested = json.loads(agent_tasks.agent_task_cancel({"task_id": task.id}))
+                self.assertEqual(requested["status"], "stopping")
+                thread.join(10)
+                self.assertFalse(thread.is_alive(), "取消後 runner 仍等待 child")
+                self.assertEqual(errors, [])
+                completed, cancelled = results[0]
+                self.assertTrue(cancelled)
+                self.assertIsNotNone(children[0].poll(), "原 child 並未停止")
+                self.assertTrue(agent_task_runner._record_completion(
+                    self.state.path, task.id, exit_code=completed.returncode, reason="cancelled",
+                ))
+                self.assertEqual(self.state.task(task.id).status, "cancelled")
+                self.assertEqual(self.state.transition_task(task.id, status="running").status, "cancelled")
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=5)
+                thread.join(5)
+
+    @unittest.skipUnless(os.name == "nt", "Windows taskkill contract")
+    def test_windows_owned_tree_stop_uses_taskkill(self) -> None:
+        process = Mock(pid=43210)
+        process.poll.return_value = None
+        completed = Mock(returncode=0)
+        with patch.object(agent_task_runner.subprocess, "run", return_value=completed) as run:
+            agent_task_runner._stop_owned_process_tree(process)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[-3:], ["43210", "/T", "/F"])
+        process.wait.assert_called_once_with(timeout=5)
 
     def test_new_instruction_is_inbox_note_not_interrupt(self) -> None:
         task = self._task()

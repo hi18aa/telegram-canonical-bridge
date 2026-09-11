@@ -25,7 +25,7 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 專門 Bot profile（OT／Research／Publisher／其他）
 ```
 
-## v0.6 的核心模式
+## v0.6.2 的核心模式
 
 - 每個派工建立獨立 conversation：`TCB Task <TASK_ID>`。
 - 不再把工作塞進可能正由 Desktop 持有的 canonical `Bot Chat`。
@@ -34,8 +34,9 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 - `sent` 只表示背景 runner 已建立。看到 worker hook、明確進度或 final output 才能判定真正開始／完成。
 - runner 會直接收斂 durable ledger；來源 session 的 completion notification 是通知主 Agent 與第二條保險，不是唯一完成條件。
 - 進度以 Telegram 新訊息發布，不反覆改寫同一則舊卡片。
-- 一般新訊息不會中斷舊任務；明確取消才會終止 runner 程序樹。
+- 一般新訊息不會中斷舊任務；明確取消才會停止該任務的程序樹。
 - 補充指示寫入 durable inbox，由 Bot 在自然檢查點讀取，不是假裝成即時 interrupt。
+- 需要逐字對外使用的文字走獨立 `exact_payload` artifact；task ID、進度與 inbox 指引不會接在正文後面。
 
 ## 明確邊界
 
@@ -54,7 +55,7 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 
 Controller 使用：
 
-- `agent_task_start`：建立 task 並啟動目標 Bot。
+- `agent_task_start`：建立 task 並啟動目標 Bot；逐字文字可用 `exact_payload.text` 自動建立 artifact。
 - `agent_task_status`：查詢可驗證狀態。
 - `agent_task_message`：加入補充指示。
 - `agent_task_cancel`：明確取消仍在執行的 runner。
@@ -213,12 +214,41 @@ Bot 處理中：@operitrace-agent 已開始處理這個 turn
 
 Hermes 原生 Telegram 仍負責主 Agent 的 typing。背景 Bot 不會偽造持續 typing；它只在有真實狀態變化時發布新訊息。
 
+### 逐字公開文字
+
+若任務包含「這段文字必須原樣發布／提交」，主 Agent 應把純正文放在 `exact_payload.text`，`message` 只放操作摘要與限制。例如：
+
+```json
+{
+  "target": "operitrace-agent",
+  "message": "把 exact payload 作為單篇貼文；先完成安全檢查，未獲授權不要發布。",
+  "exact_payload": {
+    "kind": "exact_text",
+    "text": "第一行\n\n保留兩個空格  與星星 ⭐⭐"
+  }
+}
+```
+
+使用者只需在 Telegram 提供一般命令與正文，不需要手動建立檔案。Bridge 會把 `text` 的 UTF-8 bytes 原樣寫入：
+
+```text
+<HERMES_ROOT>/plugin-data/telegram-canonical-bridge/exact-payloads/blobs/sha256/<SHA256>/body.utf8.txt
+```
+
+工具回傳與 `agent_task_status` 都會提供 `artifact_path`、`byte_length`、`sha256`、`manifest_path` 與即時 `verified` 結果。Worker 必須直接讀取 artifact bytes 並核對 digest；不得從 task 對話重建逐字正文。Bridge 的 task marker、`bridge_task_update`、`bridge_task_inbox` 與 completion 指引只留在控制面，正文 artifact 與 manifest 不含這些注入內容。
+
+`pre_llm_call` 對 worker 只負責綁定 task 與記錄啟動證據，不再回傳逐 task 控制文字。控制說明位於 handoff 前段，Controller 任務摘要位於後段，而 exact body 完全不進入 handoff conversation。
+
+**English:** For byte-exact public text, pass `exact_payload.text`. The bridge stores it as a separate UTF-8 artifact and returns a verified SHA-256 contract; the worker conversation receives only the artifact reference, never the body.
+
 ## 新訊息、取消與 session 規則
 
 - Telegram 的一般新訊息只會開啟主 Agent 的新 turn，不會自動取消任何 task。
 - 要補充：請說「補充到 task `TCB-...`：……」，主 Agent 會呼叫 `agent_task_message`。
 - 要停止：必須明確要求取消指定 task，主 Agent 才能呼叫 `agent_task_cancel`。
-- 取消會終止本機 runner 與其子程序，但不能回滾已經送出的貼文、交易或其他外部副作用。
+- 取消先保存為 `stopping`。同一 Controller 可使用既有程序 handle；不同 Controller 程序由原 runner 讀取取消要求，停止它自己啟動的 worker 程序樹並確認結束。
+- `stopping`／`ok: true` 只表示已接受取消；查到 `cancelled` 才表示停止已確認。較晚的 worker 進度不會把取消要求蓋回 `running`。取消不能回滾已送出的貼文、交易或其他外部副作用，也不能當成允許重送。
+- v0.6.2 不會熱更新升級前已啟動的舊 runner；更新應在任務閒置時進行。舊 runner 找不到 handle 時不可宣稱已停止，也不應手改 ledger 或刪除 lock。
 - 每個 task 都是新的隔離 conversation，因此不同 Controller／task 不會共用上下文。
 - task conversation 不跨任務累積大量訊息；主 Telegram session 的壓縮仍由 Hermes 原生機制管理。
 
@@ -239,6 +269,8 @@ Telegram 附件仍由 Hermes 原生 adapter 接收。主 Agent 若取得同機�
 - `sent`／`dispatched`：只證明 background runner 已建立。
 - `running`：worker profile 的 `pre_llm_call` 或可辨識 tool hook 已出現。
 - `returning`：worker final response 已被 hook 觀察。
+- `stopping`：取消要求已保存，仍待原 runner 或程序管理確認停止。
+- `cancelled`：已確認取消；不代表外部動作已回滾。
 - `completed`：final 證據與 runner 結束已收斂，或 runner 有可辨識的 final output。
 - `unconfirmed`：runner 已結束，但缺少足夠 final 證據；不可描述成成功，也不可盲目重派。
 
@@ -291,6 +323,14 @@ python -m unittest discover -s tests -v
 hermes plugins doctor --ci .
 hermes plugins compat .
 ```
+
+建立不含 `build/`、pycache 或 legacy runtime 的 source artifact：
+
+```powershell
+./scripts/build-source-artifact.ps1
+```
+
+產物位於 `dist/telegram-canonical-bridge-<version>-source.zip`。正式 `hermes plugins install` 仍以 immutable Git commit 為權威；此 zip 用於 cutover 稽核、離線比對與從同一份 source 重建。
 
 發布前還要把同一個 commit 的 artifact 安裝到 Controller 與至少一個 worker，完成無外部副作用的真實 E2E。
 

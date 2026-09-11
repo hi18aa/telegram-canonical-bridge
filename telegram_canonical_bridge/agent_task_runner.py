@@ -1,8 +1,8 @@
 """Sidecar 的 stdlib-only 背景 runner。
 
 runner 只負責跨程序序列化與呼叫 Hermes 公開 CLI；任務內容放在權限受限的
-暫存檔，不會插入 shell command line。Hermes 的背景程序 registry 會持有並
-tree-kill 這個 runner 及其子程序，因此取消可終止整棵工作程序樹。
+暫存檔，不會插入 shell command line。取消意圖由 task ledger 的 stopping
+傳給原 runner，由它停止自己啟動的 child，避免依賴別的 Controller 程序中的 handle。
 """
 
 from __future__ import annotations
@@ -14,8 +14,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -26,6 +28,10 @@ _PLUGIN_TOOLSETS = {"telegram_canonical_bridge"}
 
 
 class TargetBusyError(TimeoutError):
+    pass
+
+
+class TaskCancelledError(RuntimeError):
     pass
 
 
@@ -49,11 +55,12 @@ def _filter_plugin_toolset_startup_warning(text: str) -> str:
 
 
 class _ProfileLock:
-    def __init__(self, root: Path, profile: str, timeout_seconds: float) -> None:
+    def __init__(self, root: Path, profile: str, timeout_seconds: float, should_cancel=None) -> None:
         digest = hashlib.sha256(profile.lower().encode("utf-8")).hexdigest()[:20]
         self.path = root / f"{digest}.lock"
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.stream = None
+        self.should_cancel = should_cancel
 
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +70,10 @@ class _ProfileLock:
             self.stream.flush()
         deadline = time.monotonic() + self.timeout_seconds
         while True:
+            if self.should_cancel and self.should_cancel():
+                self.stream.close()
+                self.stream = None
+                raise TaskCancelledError("等待 profile lock 期間收到取消要求")
             try:
                 self.stream.seek(0)
                 if os.name == "nt":
@@ -110,6 +121,80 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_state(state_path: Path):
+    package_root = Path(__file__).resolve().parent.parent
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from telegram_canonical_bridge.state import BridgeState
+
+    return BridgeState(state_path)
+
+
+def _cancellation_requested(state, task_id: str) -> bool:
+    task = state.task(task_id)
+    if task is None:
+        raise RuntimeError("找不到原 runner 的 task，拒絕執行")
+    return task.status in {"stopping", "cancelled"}
+
+
+def _stop_owned_process_tree(process) -> None:
+    """只處理本 runner 持有的 Popen，不查全機 PID 或任意 profile。"""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+        stopped = subprocess.run(
+            [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, check=False,
+        )
+        if stopped.returncode != 0 and process.poll() is None:
+            raise RuntimeError("無法確認原 worker 程序樹已停止")
+    else:
+        # child 由 start_new_session 建立自己的 process group。
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    process.wait(timeout=5)
+
+
+def _run_worker_command(command, *, state, task_id: str):
+    if _cancellation_requested(state, task_id):
+        raise TaskCancelledError("啟動 worker 前收到取消要求")
+    # Windows 的 ``communicate(timeout=...)`` 會建立 pipe reader threads；反覆
+    # timeout 後再 tree-kill，關閉 pipe 可能卡在 reader thread。用本機暫存檔
+    # 捕捉輸出即可維持不限量輸出與取消語意，且 runner 不會留下背景 reader。
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
+        )
+        cancelled = False
+        try:
+            while process.poll() is None:
+                if _cancellation_requested(state, task_id):
+                    _stop_owned_process_tree(process)
+                    cancelled = True
+                    break
+                time.sleep(0.25)
+            return_code = process.wait(timeout=5)
+        except BaseException:
+            _stop_owned_process_tree(process)
+            raise
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read().decode("utf-8", errors="replace")
+        stderr = stderr_file.read().decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(
+            command,
+            130 if cancelled else int(return_code),
+            stdout,
+            stderr,
+        ), cancelled
+
+
 def _record_completion(
     state_path: Path,
     task_id: str,
@@ -122,18 +207,13 @@ def _record_completion(
     """直接收斂 durable ledger；來源 session 的完成通知只是第二條保險。"""
 
     try:
-        # 這支檔案以 script path 啟動；加入 plugin root 後再 import 自己的 package。
-        package_root = Path(__file__).resolve().parent.parent
-        if str(package_root) not in sys.path:
-            sys.path.insert(0, str(package_root))
+        state = _load_state(state_path)
         from telegram_canonical_bridge.native_delivery import kick_native_outbox
-        from telegram_canonical_bridge.state import BridgeState
         from telegram_canonical_bridge.task_completion import (
             completion_reason,
             settle_task_completion,
         )
 
-        state = BridgeState(state_path)
         updated = settle_task_completion(
             state,
             task_id,
@@ -190,16 +270,10 @@ def run(argv: list[str] | None = None) -> int:
         str(message_file),
     ]
     try:
-        with _ProfileLock(Path(args.lock_root), target, args.lock_timeout):
-            completed = subprocess.run(
-                command,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-            )
+        state = _load_state(state_path)
+        with _ProfileLock(Path(args.lock_root), target, args.lock_timeout,
+                          should_cancel=lambda: _cancellation_requested(state, task_id)):
+            completed, cancelled = _run_worker_command(command, state=state, task_id=task_id)
         stdout = _filter_plugin_toolset_startup_warning(completed.stdout)
         stderr = _filter_plugin_toolset_startup_warning(completed.stderr)
         busy = (
@@ -212,7 +286,7 @@ def run(argv: list[str] | None = None) -> int:
             exit_code=int(completed.returncode),
             output=stdout,
             diagnostic=stderr,
-            reason="target_busy" if busy else "",
+            reason="cancelled" if cancelled else "target_busy" if busy else "",
         )
         for stream, content in ((sys.stdout, stdout), (sys.stderr, stderr)):
             if content:
@@ -226,6 +300,10 @@ def run(argv: list[str] | None = None) -> int:
                 "reason": "target_busy",
             }))
         return int(completed.returncode)
+    except TaskCancelledError:
+        _record_completion(state_path, task_id, exit_code=130, reason="cancelled")
+        print(json.dumps({"reason": "cancelled", "worker_started": False}))
+        return 130
     except TargetBusyError as exc:
         _record_completion(
             state_path, task_id, exit_code=75, reason="target_busy"

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class _PluginContext:
     def __init__(self) -> None:
         self.tools: list[str] = []
+        self.tool_schemas: dict[str, dict] = {}
         self.hooks: list[str] = []
         self.commands: list[str] = []
         self.sections: list[str] = []
@@ -19,8 +20,9 @@ class _PluginContext:
     def get_config(self, _key, default=None):
         return default
 
-    def register_tool(self, *, name, **_kwargs):
+    def register_tool(self, *, name, **kwargs):
         self.tools.append(name)
+        self.tool_schemas[name] = kwargs.get("schema", {})
 
     def register_hook(self, name, _handler):
         self.hooks.append(name)
@@ -74,10 +76,16 @@ class PluginContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(context.commands, ["agenttask"])
+        start_parameters = context.tool_schemas["agent_task_start"]["parameters"]
+        self.assertIn("exact_payload", start_parameters["properties"])
+        self.assertEqual(
+            start_parameters["properties"]["exact_payload"]["properties"]["kind"]["enum"],
+            ["exact_text"],
+        )
 
     def test_manifest_declares_general_plugin(self) -> None:
         manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.6.0", manifest)
+        self.assertIn("version: 0.6.2", manifest)
         self.assertNotIn("kind: platform", manifest)
         self.assertNotIn("register_platform", (ROOT / "__init__.py").read_text(encoding="utf-8"))
 

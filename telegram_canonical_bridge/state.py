@@ -427,6 +427,9 @@ class BridgeState:
             )
             if current.terminal and not recovering:
                 return current
+            if current.status == "stopping" and status not in TERMINAL_TASK_STATUSES:
+                # 取消是 Controller 的 durable 意圖；較晚的 worker 進度／final hook 不得蓋掉它。
+                return current
 
             changes: dict[str, Any] = {}
             if status is not None and status != current.status:

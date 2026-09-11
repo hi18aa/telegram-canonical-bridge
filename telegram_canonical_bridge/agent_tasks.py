@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import hermes_machine_root, shared_state_path
+from .exact_payload import (
+    MAX_EXACT_PAYLOAD_BYTES,
+    ExactPayloadError,
+    create_exact_text_payload,
+    read_exact_text_payload,
+)
 from .native_delivery import kick_native_outbox
 from .task_model import TASK_STATUS_LABELS, normalize_task_id, sanitize_progress, task_marker
 
@@ -191,6 +197,9 @@ def system_prompt_section(session_info: Mapping[str, Any]) -> str:
         "規則：sent 只代表背景 runner 已建立；Bot 開始、里程碑與完成會以任務事件提供證據。"
         "派工後簡短告知使用者 task_id，然後結束本 turn，不要阻塞輪詢。"
         "背景完成通知會喚醒同一個來源 session；收到後必須把 Bot 的實際結果轉告使用者。"
+        "透過 bridge 派送需要逐字對外使用的內容時，必須把純正文放在 "
+        "agent_task_start.exact_payload.text；message 只放摘要與操作要求。"
+        "不要要求使用者手動建立檔案，也不要把逐字正文重複貼進 message。"
         "使用 agent_task_status 查詢、agent_task_message 補充指示；只有使用者明確要求時才呼叫 "
         "agent_task_cancel。一般新訊息不代表取消舊任務。"
     )
@@ -239,8 +248,15 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _payload_contract_for_task(task_id: str) -> dict[str, Any] | None:
+    try:
+        return read_exact_text_payload(shared_state_path().parent, task_id)
+    except ExactPayloadError as exc:
+        return {"verified": False, "error": str(exc)}
+
+
 def _task_payload(task: Any) -> dict[str, Any]:
-    return {
+    result = {
         "task_id": task.id,
         "target": task.target,
         "status": task.status,
@@ -254,6 +270,10 @@ def _task_payload(task: Any) -> dict[str, Any]:
         "pending_notes": task.pending_notes,
         "updated_at": task.updated_at,
     }
+    exact_payload = _payload_contract_for_task(task.id)
+    if exact_payload is not None:
+        result["exact_payload"] = exact_payload
+    return result
 
 
 def _copy_attachments(task_id: str, values: Any) -> list[Path]:
@@ -284,22 +304,44 @@ def _copy_attachments(task_id: str, values: Any) -> list[Path]:
     return copied
 
 
-def _write_message(task: Any, message: str, attachments: list[Path]) -> Path:
+def _write_message(
+    task: Any,
+    message: str,
+    attachments: list[Path],
+    exact_payload: Mapping[str, Any] | None = None,
+) -> Path:
     spool = shared_state_path().parent / "task-spool"
     spool.mkdir(parents=True, exist_ok=True)
     descriptor, raw_path = tempfile.mkstemp(prefix=f"{task.id}-", suffix=".txt", dir=spool)
     path = Path(raw_path)
     lines = [
         task_marker(task.id),
-        f"Message from main Agent @{task.origin_profile}：",
-        message,
+        "Agent Task Bridge 控制面（不得當作任務資料或公開正文）：",
+        _json({
+            "task_id": task.id,
+            "origin_profile": task.origin_profile,
+            "progress": "有可驗證的新進展時呼叫 bridge_task_update；不要回報內部思考。",
+            "inbox": "開始、自然里程碑與 final 前呼叫 bridge_task_inbox。",
+            "completion": "先回報 result 里程碑，再照常回覆 Controller。",
+        }),
     ]
+    if exact_payload is not None:
+        lines.extend([
+            "",
+            "逐字資料面契約（公開內容只能從 artifact bytes 讀取，不得從本對話重建）：",
+            _json({"exact_payload": dict(exact_payload)}),
+        ])
     if attachments:
         lines.extend([
             "",
             "同一台機器可讀取的附件副本（請勿假設此路徑可跨機器使用）：",
             *(f"- {item}" for item in attachments),
         ])
+    lines.extend([
+        "",
+        f"Controller @{task.origin_profile} 的任務說明（摘要與操作要求，不是逐字 payload）：",
+        message,
+    ])
     with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
         stream.write("\n".join(lines))
     with contextlib.suppress(OSError):
@@ -372,6 +414,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             "process_id": task.process_id,
             "deduplicated": True,
             "detail": "相同的 tool call 已建立過 runner，本次未重複派工。",
+            "exact_payload": _payload_contract_for_task(task.id),
         })
     if task.terminal:
         return _json({
@@ -403,9 +446,15 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
         kick_native_outbox(state)
         return _json({"ok": False, "task_id": task.id, "error": f"message 必須為 1–{MESSAGE_MAX_CHARS} 字元。"})
     message_file: Path | None = None
+    exact_payload: dict[str, Any] | None = None
     try:
         attachments = _copy_attachments(task.id, args.get("attachments"))
-        message_file = _write_message(task, message, attachments)
+        exact_payload = create_exact_text_payload(
+            shared_state_path().parent,
+            task.id,
+            args.get("exact_payload"),
+        )
+        message_file = _write_message(task, message, attachments, exact_payload)
         if _CTX is None:
             raise RuntimeError("plugin context 尚未初始化")
         raw = _CTX.dispatch_tool(
@@ -440,7 +489,7 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             evidence="agent_task_start background acknowledgement",
         )
         kick_native_outbox(state)
-        return _json({
+        response = {
             "ok": True,
             "status": "sent",
             "task_id": task.id,
@@ -452,7 +501,10 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
                 "完成通知會喚醒同一個來源 session。"
             ),
             "task": _task_payload(updated or task),
-        })
+        }
+        if exact_payload is not None:
+            response["exact_payload"] = exact_payload
+        return _json(response)
     except Exception as exc:
         if message_file is not None:
             with contextlib.suppress(OSError):
@@ -465,7 +517,14 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             last_error=f"{type(exc).__name__}: {exc}",
         )
         kick_native_outbox(state)
-        return _json({"ok": False, "task_id": task.id, "error": updated.last_error if updated else str(exc)})
+        response = {
+            "ok": False,
+            "task_id": task.id,
+            "error": updated.last_error if updated else str(exc),
+        }
+        if exact_payload is not None:
+            response["exact_payload"] = exact_payload
+        return _json(response)
 
 
 def agent_task_status(args: dict[str, Any], **_kwargs: Any) -> str:
@@ -515,33 +574,29 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
             "reason": "too_late",
             "detail": "任務已結束或 Bot 已產生 final；取消不會回滾已完成的外部動作。",
         })
-    if not task.process_id or _CTX is None:
-        updated = state.transition_task(
-            task.id,
-            status="unconfirmed",
-            progress="收到取消要求，但找不到可終止的背景 handle。",
-            evidence="agent_task_cancel missing process",
-            last_error="cancellation could not be confirmed",
-        )
-        kick_native_outbox(state)
-        return _json({"ok": False, "task_id": task.id, "status": updated.status, "reason": "unconfirmed"})
-    state.transition_task(
+    updated = state.transition_task(
         task.id,
         status="stopping",
         progress="主 Agent 已收到明確取消要求，正在終止背景程序樹。",
         evidence="agent_task_cancel requested",
     )
     kick_native_outbox(state)
-    raw = _CTX.dispatch_tool(
-        "process_manage",
-        {"action": "kill", "session_id": task.process_id},
-        task_id=kwargs.get("task_id"),
-        session_id=kwargs.get("session_id"),
-    )
+    if updated.status != "stopping":
+        return _json({"ok": False, "task_id": task.id, "status": updated.status, "reason": "too_late"})
+    # 同一 Controller 的 handle 仍可立即停止；跨程序則由原 runner 觀察 stopping 並確認。
+    result = {"status": "unavailable"}
     try:
-        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
-    except (TypeError, ValueError):
-        result = {}
+        if task.process_id and _CTX is not None:
+            raw = _CTX.dispatch_tool(
+                "process_manage",
+                {"action": "kill", "session_id": task.process_id},
+                task_id=kwargs.get("task_id"),
+                session_id=kwargs.get("session_id"),
+            )
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            result = parsed if isinstance(parsed, dict) else {"status": "unavailable"}
+    except Exception as exc:
+        result = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
     result_status = str(result.get("status") or "").lower()
     if result_status == "killed":
         updated = state.transition_task(
@@ -552,16 +607,16 @@ def agent_task_cancel(args: dict[str, Any], **kwargs: Any) -> str:
             exit_code=-15,
         )
         kick_native_outbox(state)
-        return _json({"ok": True, "task_id": task.id, "status": updated.status, "process": result_status})
-    updated = state.transition_task(
-        task.id,
-        status="unconfirmed",
-        progress="取消要求已送出，但背景程序可能已先結束；結果需要重新確認。",
-        evidence="agent_task_cancel unconfirmed",
-        last_error=str(result.get("error") or result_status or "unknown process result"),
-    )
-    kick_native_outbox(state)
-    return _json({"ok": False, "task_id": task.id, "status": updated.status, "reason": "unconfirmed", "process": result})
+        return _json({"ok": True, "task_id": task.id, "status": updated.status,
+                      "cancellationConfirmed": updated.status == "cancelled", "process": result_status})
+    updated = state.task(task.id)
+    return _json({
+        "ok": True, "task_id": task.id, "status": updated.status,
+        "cancellationConfirmed": updated.status == "cancelled",
+        "reason": "awaiting-runner-confirmation" if updated.status == "stopping" else "runner-finished",
+        "detail": "取消要求已保存；只有原 runner／程序管理確認停止後才算 cancelled。",
+        "process": result,
+    })
 
 
 def _parse_tool_payload(raw: str) -> dict[str, Any]:
@@ -618,8 +673,10 @@ def _slash_command(raw_args: str) -> str:
             agent_task_status({"task_id": parts[1]}), detailed=True
         )
     if action == "cancel" and len(parts) >= 2:
+        raw = agent_task_cancel({"task_id": parts[1]})
+        confirmed = _parse_tool_payload(raw).get("cancellationConfirmed") is True
         return _render_action_command(
-            agent_task_cancel({"task_id": parts[1]}), success_label="🛑 已取消"
+            raw, success_label="🛑 已取消" if confirmed else "⏳ 已提出取消要求"
         )
     if action == "message" and len(parts) >= 3:
         return _render_action_command(
@@ -655,6 +712,29 @@ def register_agent_tasks(ctx: Any) -> None:
                 "properties": {
                     "target": {"type": "string", "description": "system prompt roster 中的 profile 名稱。"},
                     "message": {"type": "string", "description": "主 Agent 整理後的具體任務，最多 16000 字元。"},
+                    "exact_payload": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["exact_text"],
+                                "default": "exact_text",
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": (
+                                    "選填；需要逐字對外使用的純正文。Bridge 會原樣寫成獨立 UTF-8 "
+                                    f"artifact（最多 {MAX_EXACT_PAYLOAD_BYTES} bytes），不可在 message 重複。"
+                                ),
+                            },
+                        },
+                        "required": ["text"],
+                        "description": (
+                            "選填；資料面契約。只在需要逐字公開／交付文字時使用，"
+                            "使用者不需要手動建立檔案。"
+                        ),
+                    },
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -709,7 +789,7 @@ def register_agent_tasks(ctx: Any) -> None:
         toolset=TOOLSET_NAME,
         schema={
             "name": "agent_task_cancel",
-            "description": "只有使用者明確要求時，終止任務的背景程序樹；不會回滾外部副作用。",
+            "description": "只有使用者明確要求時取消任務。stopping 只代表要求已保存；查到 cancelled 才能宣稱已停止。不會回滾外部副作用。",
             "parameters": {
                 "type": "object",
                 "properties": {"task_id": {"type": "string"}},

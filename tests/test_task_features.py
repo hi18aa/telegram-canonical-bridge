@@ -95,12 +95,25 @@ class TaskFeatureTests(unittest.TestCase):
         self.assertIsNone(self.state.task(task.id).worker_session_id)
 
         with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
-            context = task_features._before_llm(
+            injected = task_features._before_llm(
                 session_id="worker-session",
                 turn_id="worker-turn",
                 user_message=payload,
             )
-        self.assertIn(task.id, context["context"])
+        self.assertIsNone(injected)
+        self.assertEqual(self.state.task(task.id).worker_session_id, "worker-session")
+
+    def test_worker_binding_does_not_inject_control_text_after_task_payload(self) -> None:
+        task = self._dispatched()
+        clean_end = "保留換行、兩個空格  與星星 ⭐⭐"
+        payload = f"{task_marker(task.id)}\n{clean_end}"
+        with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
+            injected = task_features._before_llm(
+                session_id="worker-session",
+                turn_id="worker-turn",
+                user_message=payload,
+            )
+        self.assertIsNone(injected)
         self.assertEqual(self.state.task(task.id).worker_session_id, "worker-session")
 
     def test_worker_progress_inbox_and_final_result_form_a_closed_loop(self) -> None:

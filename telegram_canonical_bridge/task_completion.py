@@ -123,6 +123,18 @@ def settle_task_completion(
         return task
     clean_reason = str(reason or completion_reason(output) or "unknown").strip().lower()
 
+    if task.status == "stopping" and clean_reason == "cancelled" and exit_code is not None:
+        return state.transition_task(
+            task.id,
+            status="cancelled",
+            progress="原 runner 已確認工作子程序停止；已發生的外部副作用不會回滾。",
+            evidence=f"{origin}: owned worker stopped",
+            exit_code=exit_code,
+            last_error="",
+        )
+    if task.status == "stopping" and exit_code is None:
+        return task
+
     if exit_code is not None and exit_code != 0:
         # Worker final hook 已出現時，後續 CLI cleanup 非零不能抹掉既有結果。
         if task.status == "returning":

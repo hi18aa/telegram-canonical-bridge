@@ -249,20 +249,10 @@ def _before_llm(
         if bound is None:
             return None
         kick_native_outbox(state)
-        return {
-            "context": (
-                f"這是 Agent Task Bridge 追蹤任務 {task_id}。"
-                "只在有可驗證的新進展時呼叫 bridge_task_update；不要回報內部思考。"
-                "開始時、長時間操作前後、以及送出最終答覆前，呼叫 "
-                f"bridge_task_inbox(task_id=\"{task_id}\") 檢查使用者留言。"
-                "若要宣稱瀏覽器或其他介面已開啟，必須先有相應工具成功的證據。"
-                "完成工作後，先用 bridge_task_update(status=\"result\") 回報一則簡潔、"
-                "可公開的最終里程碑，"
-                "再照常回覆 Controller；bridge 會由 post_llm_call 與背景程序狀態判定完成，"
-                "不需自行宣稱 completed。若漏掉明確里程碑，bridge 只會把清理後的最終答覆"
-                "摘要留在原生訊息平台的任務時間線，不會保存內部思考或原始工具資料。"
-            )
-        }
+        # 只做身分綁定與狀態觀測，不再把逐 task 控制文字注入模型 context。
+        # 控制面位於 runner handoff 的前段；逐字資料面則只存在獨立 artifact，
+        # 因此不會出現「正文結尾緊接 bridge_task_* 指引」的連續內容。
+        return None
     except Exception:
         logger.warning("Agent Task Bridge pre_llm_call failed open", exc_info=True)
         return None
