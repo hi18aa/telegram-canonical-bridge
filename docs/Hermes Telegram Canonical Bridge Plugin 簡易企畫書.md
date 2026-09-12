@@ -101,11 +101,14 @@ Bot 在有可驗證進展時呼叫 `bridge_task_update`。事件經 SQLite outbo
 
 一般 Telegram 新訊息不會自動中斷既有 task。主 Agent 必須：
 
-- 補充指定 task：呼叫 `agent_task_message`，寫入 inbox。
+- 補充 active task：呼叫 `agent_task_message`，寫入 inbox。
+- 接續 resumable task：仍呼叫 `agent_task_message`，但指示只做既有狀態查詢、修復或 reconcile；bridge 會進入同一個 task conversation，不重送原任務。
 - 明確取消指定 task：呼叫 `agent_task_cancel`，終止程序樹。
 - 新需求：建立新 task。
 
 Bot 在開始、重要步驟前後及 final 前讀取 `bridge_task_inbox`。這是 cooperative checkpoint，不宣稱毫秒級 interrupt。
+
+Worker turn 在 final 前異常結束時，bridge 先標記 `settling` 並等待原 runner exit。只有收斂為 `interrupted`／`unconfirmed` 後才允許明確 continuation；中斷本身不會自動啟動第二個 runner，也不代表網站或其他外部操作失敗。
 
 ## 八、狀態與真實性
 
@@ -113,13 +116,15 @@ Bot 在開始、重要步驟前後及 final 前讀取 `bridge_task_inbox`。這�
 - `running`：真的觀察到 worker turn 或工具活動。
 - `waiting`：Bot 明確在等條件／留言。
 - `blocked`：需要協助。
+- `settling`：Bot turn 已中斷，等待原 runner 收斂；不可另開重複任務。
 - `returning`：worker final 已產生。
 - `completed`：有足夠 final 與 process 證據。
-- `unconfirmed`：程序結束但結果證據不足。
-- `failed`：可分類或明確失敗。
+- `interrupted`：worker 已開始但沒有 final，程序已非零結束；可接續同一 task，外部結果保持未知。
+- `unconfirmed`：程序結束但結果證據不足；可接續同一 task 查證。
+- `failed`：worker 啟動前已有可分類或明確失敗。若 continuation 無法取得原 task conversation，原 task 保持 resumable，等待人員判斷，不自動建立空白 conversation。
 - `cancelled`：process kill 已確認。
 
-Bridge 不會把「已排入」、「exit 0 但空回覆」或「背景 handle 消失」描述成成功。
+Bridge 不會把「已排入」、「exit 0 但空回覆」或「背景 handle 消失」描述成成功。狀態查詢另提供 `lifecycle=active|settling|resumable|terminated`，讓主 Agent 可明確選擇補充、等待、接續或停止。
 
 ## 九、Telegram 呈現
 

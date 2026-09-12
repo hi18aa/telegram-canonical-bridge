@@ -85,7 +85,7 @@ class PluginContractTests(unittest.TestCase):
 
     def test_manifest_declares_general_plugin(self) -> None:
         manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
-        self.assertIn("version: 0.6.4", manifest)
+        self.assertIn("version: 0.6.5", manifest)
         self.assertNotIn("kind: platform", manifest)
         self.assertNotIn("register_platform", (ROOT / "__init__.py").read_text(encoding="utf-8"))
 

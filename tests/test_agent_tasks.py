@@ -14,7 +14,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from telegram_canonical_bridge import agent_task_runner, agent_tasks
+from telegram_canonical_bridge import agent_task_runner, agent_tasks, task_features
 from telegram_canonical_bridge import native_delivery_runner
 from telegram_canonical_bridge.native_delivery import flush_native_outbox, kick_native_outbox
 from telegram_canonical_bridge.state import BridgeState
@@ -317,6 +317,7 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(code, 0)
         argv = run.call_args.args[0]
         self.assertEqual(argv[argv.index("-c") + 1], f"TCB Task {task_id}")
+        self.assertIn("--create-if-missing", argv)
         self.assertNotIn("Bot Chat", argv)
         self.assertEqual(argv[argv.index("--source") + 1], "tool")
         environment = run.call_args.kwargs["environment"]
@@ -324,6 +325,75 @@ class AgentTaskTests(unittest.TestCase):
             self.assertNotIn(name, environment)
         self.assertFalse(message.exists())
         self.assertEqual(self.state.task(task_id).status, "completed")
+
+    def test_continuation_runner_requires_existing_same_task_conversation(self) -> None:
+        task = self._task(process_id="proc-continuation")
+        message = Path(self.temp.name) / "continuation.txt"
+        message.write_text("只讀 inbox，不重播原始任務", encoding="utf-8")
+        completed = Mock(returncode=0, stdout="reconcile completed", stderr="")
+        with patch.object(
+            agent_task_runner,
+            "_run_worker_command",
+            return_value=(completed, False),
+        ) as run:
+            code = agent_task_runner.run([
+                "--target", task.target,
+                "--task-id", task.id,
+                "--state", str(self.state.path),
+                "--message-file", str(message),
+                "--lock-root", str(Path(self.temp.name) / "locks"),
+                "--hermes", "hermes",
+                "--continuation",
+            ])
+        self.assertEqual(code, 0)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("-c") + 1], f"TCB Task {task.id}")
+        self.assertNotIn("--create-if-missing", argv)
+        self.assertNotIn("--resume", argv)
+        self.assertFalse(message.exists())
+
+    def test_continuation_pre_turn_failure_remains_same_task_resumable(self) -> None:
+        task = self._task(process_id="proc-continuation")
+        self.state.transition_task(
+            task.id,
+            status="continuing",
+            evidence="agent_task_message continuation acknowledgement",
+        )
+        # runner 尚未進入 pre_llm 時又收到補充，evidence 會變；continuing status
+        # 仍必須保留本次 run 的性質，不能退回初次派工的 failed 規則。
+        self.state.add_agent_task_note(
+            task_id=task.id,
+            origin_profile="default",
+            text="再補一項只讀條件",
+            note_id="before-continuation-start",
+        )
+        self.assertEqual(self.state.task(task.id).evidence, "agent_task_message")
+        message = Path(self.temp.name) / "continuation-busy.txt"
+        message.write_text("只讀 inbox", encoding="utf-8")
+        completed = Mock(
+            returncode=75,
+            stdout="",
+            stderr="task conversation already has a live owner",
+        )
+        with patch.object(
+            agent_task_runner,
+            "_run_worker_command",
+            return_value=(completed, False),
+        ):
+            code = agent_task_runner.run([
+                "--target", task.target,
+                "--task-id", task.id,
+                "--state", str(self.state.path),
+                "--message-file", str(message),
+                "--lock-root", str(Path(self.temp.name) / "locks"),
+                "--hermes", "hermes",
+                "--continuation",
+            ])
+        self.assertEqual(code, 75)
+        resumed = self.state.task(task.id)
+        self.assertEqual(resumed.status, "interrupted")
+        self.assertTrue(resumed.resumable)
+        self.assertFalse(resumed.final)
 
     def test_runner_exposes_verified_exact_payload_reference_without_body(self) -> None:
         task = self._task()
@@ -544,6 +614,261 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual([note.text for note in notes], ["補充條件"])
         self.assertNotEqual(updated.status, "cancelled")
 
+    def test_message_explicitly_resumes_same_interrupted_task_without_replay(self) -> None:
+        context = _FakeContext(terminal_result={
+            "session_id": "proc_continued",
+            "exit_code": None,
+            "error": None,
+        })
+        agent_tasks._CTX = context
+        task = self._task(process_id="proc_original")
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="worker-session",
+            worker_turn_id="worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="settling",
+            progress="synthetic turn interrupted",
+            evidence="hook:on_session_end failed",
+        )
+        interrupted = task_features.settle_task_completion(
+            self.state,
+            task.id,
+            exit_code=1,
+            reason="provider_server_error",
+            origin="synthetic runner",
+        )
+        self.assertEqual(interrupted.lifecycle, "resumable")
+
+        exact_body = "不可重送的逐字資料\n\n兩個空格  ⭐⭐"
+        agent_tasks.create_exact_text_payload(
+            self.state_path.parent,
+            task.id,
+            {"text": exact_body},
+        )
+        follow_up = "只查詢 synthetic dispatch 的既有結果並 reconcile；不要重做。"
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            result = json.loads(agent_tasks.agent_task_message(
+                {"task_id": task.id, "message": follow_up},
+                session_id=task.origin_session_id,
+                tool_call_id="resume-call-1",
+            ))
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["continuation_started"])
+        self.assertEqual(result["task_id"], task.id)
+        self.assertEqual(result["process_id"], "proc_continued")
+        self.assertEqual(result["lifecycle"], "active")
+        self.assertEqual(len(context.calls), 1)
+        name, terminal_args, _kwargs = context.calls[0]
+        self.assertEqual(name, "terminal")
+        argv = shlex.split(terminal_args["command"])
+        self.assertIn("--continuation", argv)
+        self.assertEqual(argv[argv.index("--task-id") + 1], task.id)
+        handoff = Path(argv[argv.index("--message-file") + 1]).read_text(encoding="utf-8")
+        self.assertIn("bridge_task_inbox", handoff)
+        self.assertIn("不得自動重播", handoff)
+        self.assertNotIn(follow_up, handoff)
+        self.assertNotIn(exact_body, handoff)
+
+        current, notes = self.state.read_task_notes(task.id, mark_read=False)
+        self.assertEqual([note.text for note in notes], [follow_up])
+        self.assertEqual(current.process_id, "proc_continued")
+
+        # Hermes 重送同一 tool call 時，留言與 continuation runner 都必須冪等。
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            duplicate = json.loads(agent_tasks.agent_task_message(
+                {"task_id": task.id, "message": follow_up},
+                session_id=task.origin_session_id,
+                tool_call_id="resume-call-1",
+            ))
+        self.assertTrue(duplicate["ok"])
+        self.assertFalse(duplicate["continuation_started"])
+        self.assertIn("未重複加入", duplicate["detail"])
+        self.assertEqual(len(context.calls), 1)
+        _current, notes = self.state.read_task_notes(task.id, mark_read=False)
+        self.assertEqual([note.text for note in notes], [follow_up])
+
+        # continuation 已在跑時，後續訊息只進 inbox，不建立第二個 runner。
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            appended = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "再補一項只讀檢查",
+            }))
+        self.assertTrue(appended["ok"])
+        self.assertFalse(appended["continuation_started"])
+        self.assertEqual(len(context.calls), 1)
+
+        # claim 已清除舊 process identity；舊 completion 不得污染新 runner。
+        old_completion = (
+            "[IMPORTANT: Background process proc_original exited (exit code 1).\n"
+            "Command: hidden\nOutput:\n{\"reason\":\"provider_server_error\"}]"
+        )
+        self.assertTrue(task_features._observe_process_completion(self.state, old_completion))
+        after_old = self.state.task(task.id)
+        self.assertEqual(after_old.status, "continuing")
+        self.assertEqual(after_old.process_id, "proc_continued")
+
+    def test_message_waits_for_interrupted_runner_to_settle(self) -> None:
+        task = self._task(process_id="proc_settling")
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="worker-session",
+            worker_turn_id="worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="settling",
+            progress="waiting for exit",
+            evidence="hook:on_session_end interrupted",
+        )
+        agent_tasks._CTX = _FakeContext()
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            result = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "請接續查詢",
+            }))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "runner_settling")
+        self.assertEqual(agent_tasks._CTX.calls, [])
+        _task, notes = self.state.read_task_notes(task.id, mark_read=False)
+        self.assertEqual(notes, [])
+
+    def test_continuation_spawn_failure_stays_resumable_without_auto_retry(self) -> None:
+        task = self._task(process_id="proc_original")
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="worker-session",
+            worker_turn_id="worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="interrupted",
+            progress="synthetic runner stopped",
+            evidence="synthetic runner: recoverable exit 1",
+            exit_code=1,
+        )
+        context = _FakeContext(terminal_result={
+            "session_id": "",
+            "exit_code": None,
+            "error": "background unavailable",
+        })
+        agent_tasks._CTX = context
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            result = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "只做 reconcile，不重做 synthetic dispatch",
+            }))
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["continuation_started"])
+        self.assertTrue(result["resumable"])
+        self.assertEqual(self.state.task(task.id).status, "interrupted")
+        self.assertEqual(len(context.calls), 1)
+        _task, notes = self.state.read_task_notes(task.id, mark_read=False)
+        self.assertEqual(len(notes), 1)
+
+    def test_legacy_failure_spawn_failure_converts_to_interrupted(self) -> None:
+        task = self._task(status="running", process_id="proc_legacy")
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="legacy-worker-session",
+            worker_turn_id="legacy-worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="failed",
+            progress="legacy provider interruption",
+            evidence="hook:on_session_end failed",
+        )
+        context = _FakeContext(terminal_result={
+            "session_id": "",
+            "exit_code": None,
+            "error": "background unavailable",
+        })
+        agent_tasks._CTX = context
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            result = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "只查既有結果，不要重做",
+            }))
+        current = self.state.task(task.id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(current.status, "interrupted")
+        self.assertTrue(current.resumable)
+        self.assertFalse(current.final)
+
+    def test_dispatched_continuation_is_never_reopened_after_ledger_ack_error(self) -> None:
+        task = self._task(process_id="proc_original")
+        self.state.bind_worker(
+            task.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="worker-session",
+            worker_turn_id="worker-turn",
+        )
+        self.state.transition_task(
+            task.id,
+            status="interrupted",
+            progress="synthetic runner stopped",
+            evidence="synthetic runner: recoverable exit 1",
+            exit_code=1,
+        )
+        context = _FakeContext(terminal_result={
+            "session_id": "proc_continuation_unknown_ledger",
+            "exit_code": None,
+            "error": None,
+        })
+        agent_tasks._CTX = context
+        original_transition = self.state.transition_task
+
+        def fail_ack(task_id, **changes):
+            if changes.get("evidence") == "agent_task_message continuation acknowledgement":
+                raise sqlite3.OperationalError("synthetic ledger write failure")
+            return original_transition(task_id, **changes)
+
+        with (
+            patch.object(agent_tasks, "_state_and_profile", return_value=(self.state, "default")),
+            patch.object(self.state, "transition_task", side_effect=fail_ack),
+        ):
+            result = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "只 reconcile synthetic result",
+            }))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["continuation_started"])
+        self.assertEqual(result["process_id"], "proc_continuation_unknown_ledger")
+        self.assertEqual(self.state.task(task.id).status, "continuing")
+        self.assertEqual(len(context.calls), 1)
+
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            appended = json.loads(agent_tasks.agent_task_message({
+                "task_id": task.id,
+                "message": "補充只讀證據",
+            }))
+        self.assertTrue(appended["ok"])
+        self.assertFalse(appended["continuation_started"])
+        self.assertEqual(len(context.calls), 1)
+
     def test_slash_status_is_human_readable(self) -> None:
         rendered = agent_tasks._render_status_command(json.dumps({
             "ok": True,
@@ -563,6 +888,41 @@ class AgentTaskTests(unittest.TestCase):
         self.assertIn("📋 TCB-20260910-ABC123｜Bot 處理中", rendered)
         self.assertIn("Worker turn：已啟動", rendered)
         self.assertNotIn('{"ok"', rendered)
+
+    def test_status_exposes_active_resumable_and_terminated_lifecycles(self) -> None:
+        active = self._task(status="running", process_id="proc-active")
+        resumable = self._task(status="interrupted", process_id="proc-ended")
+        terminated = self._task(status="completed", process_id="proc-complete")
+        legacy = self._task(status="running", process_id="proc-legacy-ended")
+        self.state.bind_worker(
+            legacy.id,
+            worker_profile="operitrace-agent",
+            worker_session_id="legacy-worker-session",
+            worker_turn_id="legacy-worker-turn",
+        )
+        legacy = self.state.transition_task(
+            legacy.id,
+            status="failed",
+            progress="legacy worker interruption",
+            evidence="hook:on_session_end failed",
+        )
+        with patch.object(
+            agent_tasks, "_state_and_profile", return_value=(self.state, "default")
+        ):
+            payload = json.loads(agent_tasks.agent_task_status({}))
+        by_id = {row["task_id"]: row for row in payload["tasks"]}
+        self.assertEqual(by_id[active.id]["lifecycle"], "active")
+        self.assertFalse(by_id[active.id]["resumable"])
+        self.assertEqual(by_id[resumable.id]["lifecycle"], "resumable")
+        self.assertTrue(by_id[resumable.id]["resumable"])
+        self.assertFalse(by_id[resumable.id]["final"])
+        self.assertEqual(by_id[terminated.id]["lifecycle"], "terminated")
+        self.assertTrue(by_id[terminated.id]["final"])
+        self.assertEqual(by_id[legacy.id]["status"], "failed")
+        self.assertEqual(by_id[legacy.id]["lifecycle"], "resumable")
+        self.assertTrue(by_id[legacy.id]["resumable"])
+        self.assertFalse(by_id[legacy.id]["final"])
+        self.assertIn("舊版 worker 中斷", by_id[legacy.id]["status_label"])
 
 
 if __name__ == "__main__":

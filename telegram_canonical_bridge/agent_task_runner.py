@@ -123,6 +123,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--lock-root", required=True)
     parser.add_argument("--lock-timeout", type=float, default=3600.0)
     parser.add_argument("--hermes", default="")
+    parser.add_argument(
+        "--continuation",
+        action="store_true",
+        help="Resume the existing task conversation without recreating or replaying it.",
+    )
     return parser
 
 
@@ -286,13 +291,18 @@ def run(argv: list[str] | None = None) -> int:
         "~",
         "-c",
         conversation,
-        "--create-if-missing",
+    ]
+    # 初次派工才可建立 conversation；continuation 若找不到原 conversation 必須
+    # 安全失敗，不能悄悄建立空白 session 再重做任務。
+    if not args.continuation:
+        command.append("--create-if-missing")
+    command.extend([
         "--source",
         "tool",
         "-Q",
         "--query-file",
         str(message_file),
-    ]
+    ])
     try:
         state = _load_state(state_path)
         worker_environment = _worker_environment(state_path, task_id)

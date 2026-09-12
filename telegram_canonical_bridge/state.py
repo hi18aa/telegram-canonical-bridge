@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .task_model import (
-    RECOVERABLE_TERMINAL_TASK_STATUSES,
+    FINAL_TASK_STATUSES,
     TASK_STATUS_LABELS,
     TERMINAL_TASK_STATUSES,
     OutboxRecord,
@@ -367,7 +367,9 @@ class BridgeState:
         )
 
     def _reconcile_closed_task_notes(self) -> int:
-        closed = ("returning", *sorted(TERMINAL_TASK_STATUSES))
+        # 可接續的 interrupted／unconfirmed 必須保留未讀指示，下一個同 task
+        # continuation 才能取得；只有真正結案或 final 已產生才算 missed。
+        closed = ("returning", *sorted(FINAL_TASK_STATUSES))
         placeholders = ",".join("?" for _ in closed)
         reconciled = 0
         with self._transaction() as connection:
@@ -379,6 +381,8 @@ class BridgeState:
             ).fetchall()
             for row in rows:
                 task = self._task_from_row(row)
+                if task.resumable:
+                    continue
                 now = time.time()
                 missed = self._mark_unread_notes_missed_locked(connection, task.id, now=now)
                 if not missed:
@@ -421,7 +425,7 @@ class BridgeState:
             if current is None:
                 return None
             recovering = (
-                current.status in RECOVERABLE_TERMINAL_TASK_STATUSES
+                current.resumable
                 and status is not None
                 and status != current.status
             )
@@ -466,18 +470,21 @@ class BridgeState:
             next_status = str(changes.get("status", current.status))
             if next_status in TERMINAL_TASK_STATUSES:
                 changes["finished_at"] = now
-            elif current.status in RECOVERABLE_TERMINAL_TASK_STATUSES:
+            elif current.resumable:
                 changes["finished_at"] = None
             assignments = ", ".join(f"{field} = ?" for field in changes)
             connection.execute(
                 f"UPDATE tasks SET {assignments} WHERE task_id = ?",
                 (*changes.values(), normalized),
             )
-            missed = 0
-            if next_status == "returning" or next_status in TERMINAL_TASK_STATUSES:
-                missed = self._mark_unread_notes_missed_locked(connection, normalized, now=now)
             updated = self._task_locked(connection, normalized)
             assert updated is not None
+            missed = 0
+            closes_notes = next_status == "returning" or updated.final
+            if closes_notes:
+                missed = self._mark_unread_notes_missed_locked(connection, normalized, now=now)
+                updated = self._task_locked(connection, normalized)
+                assert updated is not None
             self._record_task_event_locked(connection, updated)
             self._queue_task_event_locked(connection, updated)
             self._queue_missed_notes_notice_locked(connection, updated, missed)
@@ -500,6 +507,59 @@ class BridgeState:
             worker_session_id=worker_session_id,
             worker_turn_id=worker_turn_id,
         )
+
+    def claim_task_continuation(
+        self,
+        *,
+        task_id: str,
+        origin_profile: str,
+    ) -> tuple[TaskRecord | None, bool, str]:
+        """以 CAS 保留一次同 task continuation，不重送原始派工內容。
+
+        claim 會清除上一個 runner 的即時 identity，避免其較晚 completion
+        notification 誤套到新 runner；歷史狀態仍保留在 task_events。
+        """
+
+        normalized = normalize_task_id(task_id)
+        if not normalized:
+            return None, False, "task_id 無效。"
+        with self._transaction() as connection:
+            task = self._task_locked(connection, normalized)
+            if task is None:
+                return None, False, "找不到這個任務。"
+            if task.origin_profile != str(origin_profile or "default"):
+                return task, False, "只有建立任務的主 Agent profile 可以接續。"
+            if not task.resumable:
+                return task, False, "任務目前不是可接續狀態。"
+
+            now = time.time()
+            cursor = connection.execute(
+                "UPDATE tasks SET status = 'continuing', process_id = NULL, "
+                "worker_profile = NULL, worker_session_id = NULL, worker_turn_id = NULL, "
+                "exit_code = NULL, last_error = '', finished_at = NULL, progress = ?, evidence = ?, "
+                "updated_at = ?, revision = revision + 1 "
+                "WHERE task_id = ? AND (status IN ('interrupted', 'unconfirmed') OR "
+                "(status = 'failed' AND worker_session_id IS NOT NULL))",
+                (
+                    "主 Agent 已提供明確接續指示；正在建立同一 task 的 continuation runner。",
+                    sanitize_progress(
+                        "agent_task_message continuation intent; "
+                        f"previous_process={task.process_id or 'none'}; "
+                        f"previous_session={task.worker_session_id or 'none'}",
+                        limit=180,
+                    ),
+                    now,
+                    normalized,
+                ),
+            )
+            if cursor.rowcount != 1:
+                current = self._task_locked(connection, normalized)
+                return current, False, "另一個 caller 已接管同一 task 的 continuation。"
+            updated = self._task_locked(connection, normalized)
+            assert updated is not None
+            self._record_task_event_locked(connection, updated)
+            self._queue_task_event_locked(connection, updated)
+            return updated, True, "已保留同一 task 的 continuation runner。"
 
     def task_for_worker(self, session_id: str, turn_id: str = "") -> TaskRecord | None:
         if not session_id:
@@ -536,8 +596,12 @@ class BridgeState:
             row = connection.execute(
                 "SELECT progress FROM task_events WHERE task_id = ? "
                 "AND evidence IN ('Bot explicit bridge_task_update', "
-                "'Bot explicit bridge_task_result') ORDER BY id DESC LIMIT 1",
-                (normalized,),
+                "'Bot explicit bridge_task_result') "
+                "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+                "WHERE task_id = ? AND evidence LIKE "
+                "'agent_task_message continuation intent%'), 0) "
+                "ORDER BY id DESC LIMIT 1",
+                (normalized, normalized),
             ).fetchone()
         return str(row["progress"]) if row else ""
 
@@ -548,8 +612,12 @@ class BridgeState:
         with self._read_connection() as connection:
             row = connection.execute(
                 "SELECT progress FROM task_events WHERE task_id = ? "
-                "AND evidence = 'Bot explicit bridge_task_result' ORDER BY id DESC LIMIT 1",
-                (normalized,),
+                "AND evidence = 'Bot explicit bridge_task_result' "
+                "AND id > COALESCE((SELECT MAX(id) FROM task_events "
+                "WHERE task_id = ? AND evidence LIKE "
+                "'agent_task_message continuation intent%'), 0) "
+                "ORDER BY id DESC LIMIT 1",
+                (normalized, normalized),
             ).fetchone()
         return str(row["progress"]) if row else ""
 
@@ -623,16 +691,24 @@ class BridgeState:
                 return None, False, "找不到這個任務。"
             if task.origin_profile != str(origin_profile or "default"):
                 return task, False, "只有建立任務的主 Agent profile 可以補充指示。"
-            if task.terminal or task.status == "returning":
+            if (task.terminal and not task.resumable) or task.status == "returning":
                 return task, False, "任務已結束或已產生最終回覆；請建立新任務。"
+            note_key = f"agent:{note_id}"
+            clean_note = clean_text[:4000]
             try:
                 connection.execute(
                     "INSERT INTO task_notes(task_id, note_key, text, status, created_at) "
                     "VALUES (?, ?, ?, 'unread', ?)",
-                    (normalized, f"agent:{note_id}", clean_text[:4000], time.time()),
+                    (normalized, note_key, clean_note, time.time()),
                 )
             except sqlite3.IntegrityError:
-                return task, False, "這則留言已經收錄。"
+                existing = connection.execute(
+                    "SELECT text FROM task_notes WHERE note_key = ?",
+                    (note_key,),
+                ).fetchone()
+                if existing is not None and str(existing["text"]) == clean_note:
+                    return task, True, "這則留言已經收錄；本次未重複加入。"
+                return task, False, "相同留言識別碼已有不同內容，拒絕覆寫。"
             now = time.time()
             connection.execute(
                 "UPDATE tasks SET progress = ?, evidence = ?, updated_at = ?, "

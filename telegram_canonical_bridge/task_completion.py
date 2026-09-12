@@ -119,7 +119,13 @@ def settle_task_completion(
     """以相同規則收斂 runner 直寫與來源 session 收到的完成通知。"""
 
     task = state.task(task_id)
-    if task is None or task.terminal:
+    # v0.6.4 曾在 runner completion 前，把已開始但無 final 的 turn 寫成
+    # ``failed``。若較晚收到原 runner 的確切 completion，仍應用新規則收斂；
+    # 其他已結案／可接續狀態則保持穩定。
+    if task is None:
+        return task
+    legacy_recoverable_failure = task.status == "failed" and task.resumable
+    if task.terminal and not legacy_recoverable_failure:
         return task
     clean_reason = str(reason or completion_reason(output) or "unknown").strip().lower()
 
@@ -147,6 +153,19 @@ def settle_task_completion(
         progress, detail = _FAILURE_MESSAGES.get(
             clean_reason, _FAILURE_MESSAGES["unknown"]
         )
+        if task.worker_started or task.status in {"settling", "continuing"}:
+            return state.transition_task(
+                task.id,
+                status="interrupted",
+                progress=(
+                    f"{progress} 原 Bot turn 或同 task continuation 已停止且沒有 final 證據；"
+                    "外部副作用可能已發生。可用 agent_task_message 接續同一 task 做"
+                    "查詢／修復／reconcile；bridge 不會自動重播原任務。"
+                ),
+                evidence=f"{origin}: recoverable exit {exit_code}; reason={clean_reason}",
+                exit_code=exit_code,
+                last_error=detail,
+            )
         return state.transition_task(
             task.id,
             status="failed",

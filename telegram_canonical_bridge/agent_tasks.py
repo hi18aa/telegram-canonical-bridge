@@ -200,8 +200,11 @@ def system_prompt_section(session_info: Mapping[str, Any]) -> str:
         "透過 bridge 派送需要逐字對外使用的內容時，必須把純正文放在 "
         "agent_task_start.exact_payload.text；message 只放摘要與操作要求。"
         "不要要求使用者手動建立檔案，也不要把逐字正文重複貼進 message。"
-        "使用 agent_task_status 查詢、agent_task_message 補充指示；只有使用者明確要求時才呼叫 "
-        "agent_task_cancel。一般新訊息不代表取消舊任務。"
+        "處理既有 task 前先用 agent_task_status 看 lifecycle：active 只補 inbox；"
+        "settling 等待 runner 收斂；resumable 可用 agent_task_message 明確要求查詢、修復或 "
+        "reconcile；它只接續同一 task conversation，不會重送原始任務；terminated 已結案。"
+        "外部副作用結果不明時，接續指示不得要求盲目 replay。只有使用者明確要求時才呼叫 "
+        "agent_task_cancel；一般新訊息不代表取消舊任務。"
     )
 
 
@@ -260,7 +263,14 @@ def _task_payload(task: Any) -> dict[str, Any]:
         "task_id": task.id,
         "target": task.target,
         "status": task.status,
-        "status_label": TASK_STATUS_LABELS.get(task.status, task.status),
+        "status_label": (
+            "可接續（舊版 worker 中斷）"
+            if task.status == "failed" and task.resumable
+            else TASK_STATUS_LABELS.get(task.status, task.status)
+        ),
+        "lifecycle": task.lifecycle,
+        "resumable": task.resumable,
+        "final": task.final,
         "progress": task.progress,
         "evidence": task.evidence,
         "process_id": task.process_id,
@@ -349,7 +359,45 @@ def _write_message(
     return path
 
 
-def _runner_command(target: str, task_id: str, message_file: Path) -> str:
+def _write_continuation_message(task: Any) -> Path:
+    """只寫同 task 接續控制面；原始任務與逐字正文一律不重送。"""
+
+    spool = shared_state_path().parent / "task-spool"
+    spool.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f"{task.id}-continuation-", suffix=".txt", dir=spool
+    )
+    path = Path(raw_path)
+    lines = [
+        task_marker(task.id),
+        "Agent Task Bridge 同一 task continuation 控制面（不是新任務或公開正文）：",
+        _json({
+            "task_id": task.id,
+            "continuation": True,
+            "inbox": "立即呼叫 bridge_task_inbox 讀取並 acknowledge 接續指示。",
+            "safety": (
+                "前一個 turn 沒有可確認 final；不得自動重播原始任務或重複外部副作用。"
+                "先依 inbox 查詢既有狀態、修復或 reconcile，再以可驗證證據回報。"
+            ),
+            "completion": "先回報 result 里程碑，再照常回覆 Controller。",
+        }),
+        "",
+        "這個 handoff 不含原始 task message、exact payload 正文或新的動作授權。",
+    ]
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write("\n".join(lines))
+    with contextlib.suppress(OSError):
+        path.chmod(0o600)
+    return path
+
+
+def _runner_command(
+    target: str,
+    task_id: str,
+    message_file: Path,
+    *,
+    continuation: bool = False,
+) -> str:
     runner = Path(__file__).resolve().with_name("agent_task_runner.py")
     hermes = shutil.which("hermes") or "hermes"
     argv = [
@@ -370,9 +418,45 @@ def _runner_command(target: str, task_id: str, message_file: Path) -> str:
         "--hermes",
         hermes,
     ]
+    if continuation:
+        argv.append("--continuation")
     if sys.platform == "win32":
         argv = [part.replace("\\", "/") for part in argv]
     return shlex.join(argv)
+
+
+def _dispatch_runner(
+    task: Any,
+    message_file: Path,
+    *,
+    continuation: bool,
+    task_id: str = "",
+    session_id: str = "",
+) -> str:
+    if _CTX is None:
+        raise RuntimeError("plugin context 尚未初始化")
+    raw = _CTX.dispatch_tool(
+        "terminal",
+        {
+            "command": _runner_command(
+                task.target, task.id, message_file, continuation=continuation
+            ),
+            "background": True,
+            "notify": True,
+            "workdir": str(shared_state_path().parent),
+        },
+        task_id=task_id,
+        session_id=session_id,
+    )
+    try:
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except (TypeError, ValueError):
+        result = {}
+    process_id = str(result.get("session_id") or "").strip()
+    error = str(result.get("error") or "").strip()
+    if error or not process_id:
+        raise RuntimeError(error or "terminal 未回傳 background process ID")
+    return process_id
 
 
 def _task_for_start(state: Any, args: dict[str, Any], profile: str, session_id: str):
@@ -455,27 +539,13 @@ def agent_task_start(args: dict[str, Any], **kwargs: Any) -> str:
             args.get("exact_payload"),
         )
         message_file = _write_message(task, message, attachments, exact_payload)
-        if _CTX is None:
-            raise RuntimeError("plugin context 尚未初始化")
-        raw = _CTX.dispatch_tool(
-            "terminal",
-            {
-                "command": _runner_command(target, task.id, message_file),
-                "background": True,
-                "notify": True,
-                "workdir": str(shared_state_path().parent),
-            },
-            task_id=kwargs.get("task_id"),
-            session_id=kwargs.get("session_id"),
+        process_id = _dispatch_runner(
+            task,
+            message_file,
+            continuation=False,
+            task_id=str(kwargs.get("task_id") or ""),
+            session_id=str(kwargs.get("session_id") or ""),
         )
-        try:
-            result = json.loads(raw) if isinstance(raw, str) else dict(raw)
-        except (TypeError, ValueError):
-            result = {}
-        process_id = str(result.get("session_id") or "").strip()
-        error = str(result.get("error") or "").strip()
-        if error or not process_id:
-            raise RuntimeError(error or "terminal 未回傳 background process ID")
         # runner 已接管 payload 清理責任。
         message_file = None
         updated = state.transition_task(
@@ -538,25 +608,148 @@ def agent_task_status(args: dict[str, Any], **_kwargs: Any) -> str:
     return _json({"ok": bool(rows), "tasks": rows})
 
 
-def agent_task_message(args: dict[str, Any], **_kwargs: Any) -> str:
+def agent_task_message(args: dict[str, Any], **kwargs: Any) -> str:
     state, profile = _state_and_profile()
     task_id = normalize_task_id(args.get("task_id"))
     message = str(args.get("message") or "").strip()
     if not task_id or not message:
         return _json({"ok": False, "error": "task_id 與 message 都是必填。"})
+    current = state.task(task_id)
+    if current is not None and current.origin_profile == profile and current.status == "settling":
+        return _json({
+            "ok": False,
+            "task_id": current.id,
+            "status": current.status,
+            "lifecycle": current.lifecycle,
+            "resumable": False,
+            "reason": "runner_settling",
+            "detail": "原 runner 尚在收斂；等完成事件後查詢同一 task，不要另開或重送。",
+        })
     task, accepted, detail = state.add_agent_task_note(
         task_id=task_id,
         origin_profile=profile,
         text=message,
-        note_id=secrets.token_hex(12),
+        note_id=(
+            f"{kwargs.get('session_id')}:{kwargs.get('tool_call_id')}"
+            if kwargs.get("session_id") and kwargs.get("tool_call_id")
+            else secrets.token_hex(12)
+        ),
     )
+    if not accepted:
+        return _json({
+            "ok": False,
+            "task_id": task.id if task else task_id,
+            "status": task.status if task else "unknown",
+            "lifecycle": task.lifecycle if task else "unknown",
+            "resumable": task.resumable if task else False,
+            "detail": detail,
+        })
+
+    continuation_started = False
+    process_id = task.process_id if task else None
+    if task is not None and task.resumable:
+        resume_from = task.status
+        claimed, should_spawn, claim_detail = state.claim_task_continuation(
+            task_id=task.id,
+            origin_profile=profile,
+        )
+        if should_spawn and claimed is not None:
+            message_file: Path | None = None
+            runner_dispatched = False
+            try:
+                message_file = _write_continuation_message(claimed)
+                process_id = _dispatch_runner(
+                    claimed,
+                    message_file,
+                    continuation=True,
+                    task_id=str(kwargs.get("task_id") or ""),
+                    session_id=str(kwargs.get("session_id") or ""),
+                )
+                runner_dispatched = True
+                # continuation runner 已接管 spool 清理責任。
+                message_file = None
+                task = state.transition_task(
+                    claimed.id,
+                    status="continuing",
+                    process_id=process_id,
+                    progress=(
+                        "Hermes 已建立同一 task 的 continuation runner；等待既有隔離 "
+                        "conversation 啟動新 turn。原始任務未重送。"
+                    ),
+                    evidence="agent_task_message continuation acknowledgement",
+                    last_error="",
+                )
+                if task is None or task.process_id != process_id:
+                    raise RuntimeError("continuation runner identity 未寫入 task ledger")
+                continuation_started = True
+                detail = (
+                    "接續 runner 已建立；它只會讀取 task inbox，原始任務與逐字正文未重送。"
+                )
+            except Exception as exc:
+                if message_file is not None:
+                    with contextlib.suppress(OSError):
+                        message_file.unlink()
+                if runner_dispatched:
+                    # background handle 已回傳後就不能把 claim 重新開放，否則 caller
+                    # retry 可能建立第二個 runner。runner 本身仍會用 task_id 直寫
+                    # completion；目前只保留 continuing 並要求查詢，絕不 replay。
+                    task = state.task(claimed.id)
+                    detail = (
+                        "continuation runner 已建立，但 process identity 未能完整寫入 ledger；"
+                        "請查詢同一 task，勿再次啟動或重播原任務。"
+                        f"（{type(exc).__name__}: {exc}）"
+                    )
+                    kick_native_outbox(state)
+                    return _json({
+                        "ok": False,
+                        "task_id": claimed.id,
+                        "status": task.status if task else "continuing",
+                        "lifecycle": task.lifecycle if task else "active",
+                        "resumable": task.resumable if task else False,
+                        "continuation_started": True,
+                        "process_id": process_id,
+                        "detail": detail,
+                    })
+                fallback_status = "interrupted" if resume_from == "failed" else resume_from
+                task = state.transition_task(
+                    claimed.id,
+                    status=fallback_status,
+                    progress=(
+                        "無法建立同一 task 的 continuation runner；留言仍保留，"
+                        "不會自動重試或重播原始任務。"
+                    ),
+                    evidence="agent_task_message continuation spawn failure",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+                detail = task.last_error if task else str(exc)
+                kick_native_outbox(state)
+                return _json({
+                    "ok": False,
+                    "task_id": claimed.id,
+                    "status": task.status if task else fallback_status,
+                    "lifecycle": task.lifecycle if task else "resumable",
+                    "resumable": task.resumable if task else True,
+                    "continuation_started": False,
+                    "detail": detail,
+                })
+        else:
+            task = claimed or state.task(task.id)
+            detail = claim_detail
     kick_native_outbox(state)
     return _json({
-        "ok": accepted,
+        "ok": True,
         "task_id": task.id if task else task_id,
         "status": task.status if task else "unknown",
+        "lifecycle": task.lifecycle if task else "unknown",
+        "resumable": task.resumable if task else False,
+        "continuation_started": continuation_started,
+        "process_id": task.process_id if task else process_id,
         "detail": detail,
-        "delivery": "補充內容會在 Bot 下一次 bridge_task_inbox 檢查時讀取；不是即時中斷。",
+        "delivery": (
+            "已建立同一 task continuation；Bot 會從 bridge_task_inbox 取得指示。"
+            if continuation_started
+            else "補充內容會在 Bot 下一次 bridge_task_inbox 檢查時讀取；不是即時中斷。"
+        ),
     })
 
 
@@ -643,6 +836,8 @@ def _render_status_command(raw: str, *, detailed: bool) -> str:
         lines = [f"📋 {task_id}｜{label}", f"Bot：@{target}", f"進度：{progress}"]
         if detailed:
             lines.extend([
+                f"Lifecycle：{task.get('lifecycle') or 'unknown'}",
+                f"可接續：{'是' if task.get('resumable') else '否'}",
                 f"Worker turn：{'已啟動' if task.get('worker_started') else '尚未觀察'}",
                 f"Final：{'已觀察' if task.get('final_observed') else '尚無證據'}",
                 f"Exit code：{task.get('exit_code') if task.get('exit_code') is not None else '尚無'}",
@@ -770,7 +965,11 @@ def register_agent_tasks(ctx: Any) -> None:
         toolset=TOOLSET_NAME,
         schema={
             "name": "agent_task_message",
-            "description": "替執行中的任務加入補充指示；Bot 會在下一個 inbox 檢查點讀取。",
+            "description": (
+                "替 active 任務加入 inbox 指示；若 task lifecycle=resumable，"
+                "則以該指示啟動同一 task conversation 的 continuation。"
+                "不會重送原始任務或自動 replay 外部副作用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -781,7 +980,7 @@ def register_agent_tasks(ctx: Any) -> None:
             },
         },
         handler=agent_task_message,
-        description="補充專門 Bot 任務指示",
+        description="補充或安全接續專門 Bot 任務",
         emoji="✉️",
     )
     ctx.register_tool(

@@ -25,7 +25,7 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 專門 Bot profile（OT／Research／Publisher／其他）
 ```
 
-## v0.6.4 的核心模式
+## v0.6.5 的核心模式
 
 - 每個派工建立獨立 conversation：`TCB Task <TASK_ID>`。
 - 不再把工作塞進可能正由 Desktop 持有的 canonical `Bot Chat`。
@@ -37,6 +37,8 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 - 一般新訊息不會中斷舊任務；明確取消才會停止該任務的程序樹。
 - 補充指示寫入 durable inbox，由 Bot 在自然檢查點讀取，不是假裝成即時 interrupt。
 - 需要逐字對外使用的文字走獨立 `exact_payload` artifact；task ID、進度與 inbox 指引不會接在正文後面。
+- 已開始的 Bot turn 若因 provider、執行預算或 runner 異常而中斷，會先成為 `settling`，取得程序結束證據後成為 `interrupted/resumable`；不會過早宣稱網站流程失敗。
+- 可接續 task 只有在 Main 明確傳送 `agent_task_message` 後，才會用同一個 `TCB Task <TASK_ID>` conversation 啟動下一個 turn。Continuation 只讀 inbox，不重送原始任務或自動 replay 外部副作用。
 
 ## 明確邊界
 
@@ -57,7 +59,7 @@ Controller 使用：
 
 - `agent_task_start`：建立 task 並啟動目標 Bot；逐字文字可用 `exact_payload.text` 自動建立 artifact。
 - `agent_task_status`：查詢可驗證狀態。
-- `agent_task_message`：加入補充指示。
+- `agent_task_message`：active task 寫入補充指示；resumable task 則以該指示安全接續同一 task。
 - `agent_task_cancel`：明確取消仍在執行的 runner。
 
 Worker 使用：
@@ -235,7 +237,7 @@ Hermes 原生 Telegram 仍負責主 Agent 的 typing。背景 Bot 不會偽造�
 <HERMES_ROOT>/plugin-data/telegram-canonical-bridge/exact-payloads/blobs/sha256/<SHA256>/body.utf8.txt
 ```
 
-工具回傳與 `agent_task_status` 都會提供 `artifact_path`、`byte_length`、`sha256`、`manifest_path` 與即時 `verified` 結果。Worker 必須直接讀取 artifact bytes 並核對 digest；不得從 task 對話重建逐字正文。為避免手抄長路徑或雜湊，v0.6.4 也只把 artifact reference 透過 `HERMES_AGENT_TASK_EXACT_PAYLOAD_PATH`、`HERMES_AGENT_TASK_EXACT_PAYLOAD_SHA256` 與 `HERMES_AGENT_TASK_EXACT_PAYLOAD_BYTE_LENGTH` 傳給該次 Worker；環境變數不含正文，無逐字 payload 的任務會清除同名舊值。Bridge 的 task marker、`bridge_task_update`、`bridge_task_inbox` 與 completion 指引只留在控制面，正文 artifact 與 manifest 不含這些注入內容。
+工具回傳與 `agent_task_status` 都會提供 `artifact_path`、`byte_length`、`sha256`、`manifest_path` 與即時 `verified` 結果。Worker 必須直接讀取 artifact bytes 並核對 digest；不得從 task 對話重建逐字正文。自 v0.6.4 起，bridge 也只把 artifact reference 透過 `HERMES_AGENT_TASK_EXACT_PAYLOAD_PATH`、`HERMES_AGENT_TASK_EXACT_PAYLOAD_SHA256` 與 `HERMES_AGENT_TASK_EXACT_PAYLOAD_BYTE_LENGTH` 傳給該次 Worker；環境變數不含正文，無逐字 payload 的任務會清除同名舊值。Bridge 的 task marker、`bridge_task_update`、`bridge_task_inbox` 與 completion 指引只留在控制面，正文 artifact 與 manifest 不含這些注入內容。
 
 `pre_llm_call` 不再對一般 Controller turn 回傳重複的動態派工說明；Controller 指引只由正式 system prompt section 提供。對 worker 則只綁定 task 與記錄啟動證據，不回傳逐 task 控制文字。控制說明位於 handoff 前段，Controller 任務摘要位於後段，而 exact body 完全不進入 handoff conversation。
 
@@ -244,11 +246,13 @@ Hermes 原生 Telegram 仍負責主 Agent 的 typing。背景 Bot 不會偽造�
 ## 新訊息、取消與 session 規則
 
 - Telegram 的一般新訊息只會開啟主 Agent 的新 turn，不會自動取消任何 task。
-- 要補充：請說「補充到 task `TCB-...`：……」，主 Agent 會呼叫 `agent_task_message`。
+- 要補充 active task：請說「補充到 task `TCB-...`：……」，主 Agent 會呼叫 `agent_task_message`，內容只進 durable inbox，不會打斷當前 turn。
+- 若 task 是 `resumable`：請明確要求「接續 task `TCB-...`，只查詢既有 transaction／結果並 reconcile，不要重做」。同一個 `agent_task_message` 會啟動既有 task conversation 的下一個 turn；它不是新 task。
+- 若 task 是 `settling`：先等 runner completion event 再查詢。Bridge 會拒絕此時的 continuation，避免舊 runner 尚未退出就出現第二個 turn。
 - 要停止：必須明確要求取消指定 task，主 Agent 才能呼叫 `agent_task_cancel`。
 - 取消先保存為 `stopping`。同一 Controller 可使用既有程序 handle；不同 Controller 程序由原 runner 讀取取消要求，停止它自己啟動的 worker 程序樹並確認結束。
 - `stopping`／`ok: true` 只表示已接受取消；查到 `cancelled` 才表示停止已確認。較晚的 worker 進度不會把取消要求蓋回 `running`。取消不能回滾已送出的貼文、交易或其他外部副作用，也不能當成允許重送。
-- v0.6.4 不會熱更新升級前已啟動的舊 runner；更新應在任務閒置時進行。舊 runner 找不到 handle 時不可宣稱已停止，也不應手改 ledger 或刪除 lock。
+- v0.6.5 不會熱更新升級前已啟動的舊 runner；更新應在任務閒置時進行。舊 runner 找不到 handle 時不可宣稱已停止，也不應手改 ledger 或刪除 lock。
 - 每個 task 都是新的隔離 conversation，因此不同 Controller／task 不會共用上下文。
 - task conversation 不跨任務累積大量訊息；主 Telegram session 的壓縮仍由 Hermes 原生機制管理。
 
@@ -268,11 +272,23 @@ Telegram 附件仍由 Hermes 原生 adapter 接收。主 Agent 若取得同機�
 
 - `sent`／`dispatched`：只證明 background runner 已建立。
 - `running`：worker profile 的 `pre_llm_call` 或可辨識 tool hook 已出現。
+- `settling`：worker lifecycle hook 已確認 turn 在 final 前中斷，但原 runner 尚未回報 exit；不可接續、不可另開重複任務。
+- `continuing`：Main 已明確送出接續指示，bridge 正在同一 task conversation 建立／等待新 turn；原始任務未重送。
 - `returning`：worker final response 已被 hook 觀察。
 - `stopping`：取消要求已保存，仍待原 runner 或程序管理確認停止。
 - `cancelled`：已確認取消；不代表外部動作已回滾。
 - `completed`：final 證據與 runner 結束已收斂，或 runner 有可辨識的 final output。
-- `unconfirmed`：runner 已結束，但缺少足夠 final 證據；不可描述成成功，也不可盲目重派。
+- `interrupted`：worker 已開始且 runner 已非零結束，沒有 final 證據；外部副作用可能已發生，`lifecycle=resumable`。
+- `unconfirmed`：runner 已結束但缺少足夠 final 證據；同樣是 `lifecycle=resumable`，不可描述成成功。
+- `failed`：初次派工在 worker 尚未啟動前已有明確失敗；`lifecycle=terminated`。Continuation 若在新 turn 前失敗則仍保留為 resumable，不會迫使 Main 建立新 task。v0.6.4 已留下、具 worker session 且無 final 證據的 `failed` 紀錄會原樣保留，但以 `lifecycle=resumable` 呈現；不自動遷移、不自動啟動 runner。
+
+`agent_task_status` 會直接回傳 `lifecycle`、`resumable` 與 `final`。Main 應依 `active`／`settling`／`resumable`／`terminated` 決定是補 inbox、等待、接續同 task，或停止處理；不能因看到 runner 中斷就另呼叫 `agent_task_start`。Continuation 的公開 CLI 仍是同一個命名 conversation：
+
+```text
+hermes -p <target> chat --in ~ -c "TCB Task <TASK_ID>" --source tool -Q --query-file <continuation-control>
+```
+
+接續時刻意不帶 `--create-if-missing`。如果原 conversation 不存在，runner 會安全失敗並讓 task 保持 resumable，不會建立空白 conversation 冒充接續。
 
 事件寫入 SQLite durable outbox，再透過公開 `hermes -p <Controller profile> send` 依 task 保序傳送；暫時失敗會退避重試。送信程序即使由 worker hook 喚醒，也會明確切回來源 Controller profile，不會誤用 worker 的 Telegram 設定。每個正常 Controller turn 也會重新喚醒尚未送完的 outbox。即使一次性 Controller CLI 已先結束，runner 仍會直接寫入最終狀態並喚醒 outbox。
 
@@ -298,6 +314,18 @@ hermes -p operitrace-agent chat -Q -q "只回覆 WORKER_OK"
 ```
 
 若 worker CLI 本身無法完成，先修正該 profile 的 provider、model、credentials 或 tool 設定。這不是網站操作失敗，而是 worker turn 尚未啟動。
+
+### Bot 已操作一部分，但 provider／預算中斷
+
+先用 `/agenttask status <TASK_ID>` 或 `agent_task_status` 查詢：
+
+- `lifecycle=settling`：等待原 runner exit，不重派。
+- `lifecycle=resumable`：用 `agent_task_message` 傳入「查詢既有狀態／transaction、修復、reconcile；不要重做」；bridge 會接續同一 task。
+- `lifecycle=terminated`：不要把同一內容自動重播；依已知外部證據由人決定下一步。
+
+Bridge 只保證 task、runner、conversation 與 inbox 的生命週期。瀏覽器是否關閉、系統通知遮擋、網站 selector、transaction 查詢與 reconciliation 都屬於專門 Bot／其操作工具的責任，不應寫進 bridge。
+
+Bridge 的 at-most-once 保證限於相同派工 tool call 與 continuation claim 不重複建立 runner，並且接續時不重送原始 payload。網站端是否已 dispatch 必須由 OT／OperiTrace 依原 transaction 證據判斷；Bridge 不會自動重播，也不把通用 task 狀態冒充網站冪等保證。
 
 ### 看不到 Telegram 任務事件
 
@@ -344,7 +372,7 @@ This plugin leaves native Telegram completely in charge of user-facing messages,
 4. Configure `delivery_target: telegram` and an explicit `agents` roster.
 5. Restart the gateway and run Plugin Doctor for both controller and worker.
 
-Every task runs in its own named Hermes conversation (`TCB Task <TASK_ID>`), so Desktop ownership of canonical `Bot Chat` cannot turn a dispatch into a queue-only acknowledgement. Tasks targeting the same worker profile are serialized. Follow-up messages are durable inbox notes; only explicit cancellation terminates the process tree.
+Every task runs in its own named Hermes conversation (`TCB Task <TASK_ID>`), so Desktop ownership of canonical `Bot Chat` cannot turn a dispatch into a queue-only acknowledgement. Tasks targeting the same worker profile are serialized. Follow-up messages are durable inbox notes; only explicit cancellation terminates the process tree. If a started worker turn ends without a final result, status becomes resumable only after runner settlement. An explicit `agent_task_message` then continues the same named conversation with inbox-only recovery instructions; the bridge never automatically replays the original task or unknown external side effects.
 
 ## License
 

@@ -291,27 +291,21 @@ def _on_session_end(
     try:
         state = _state()
         task = state.task_for_worker(session_id, turn_id)
-        if task is None or task.terminal:
+        if task is None or task.terminal or task.status == "returning":
             return
         reason = sanitize_progress(turn_exit_reason, limit=280)
-        if failed:
-            _transition_task(
-                state,
-                task.id,
-                status="failed",
-                progress="Bot turn 在產生最終回覆前失敗。",
-                evidence="hook:on_session_end failed",
-                last_error=reason or "worker turn failed",
-            )
-        else:
-            _transition_task(
-                state,
-                task.id,
-                status="blocked",
-                progress="Bot turn 被中斷；任務可能需要重新派送。",
-                evidence="hook:on_session_end interrupted",
-                last_error=reason,
-            )
+        kind = "failed" if failed else "interrupted"
+        _transition_task(
+            state,
+            task.id,
+            status="settling",
+            progress=(
+                "Bot turn 在 final 前中斷；bridge 正等待原 runner 的結束證據。"
+                "此時不會重送原任務，也不能把網站或其他外部結果判定為失敗。"
+            ),
+            evidence=f"hook:on_session_end {kind}",
+            last_error=reason or f"worker turn {kind}",
+        )
     except Exception:
         logger.warning("Agent Task Bridge session-end observer failed", exc_info=True)
 
@@ -390,6 +384,9 @@ def bridge_task_status(args: dict[str, Any], **_: Any) -> str:
             "task_id": task.id,
             "target": task.target,
             "status": task.status,
+            "lifecycle": task.lifecycle,
+            "resumable": task.resumable,
+            "final": task.final,
             "progress": task.progress,
             "evidence": task.evidence,
             "process_id": task.process_id,

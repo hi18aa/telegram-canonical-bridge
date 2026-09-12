@@ -235,6 +235,76 @@ class TaskFeatureTests(unittest.TestCase):
         self.assertIn("provider", failed.progress)
         self.assertNotIn("SECRET COMMAND", failed.progress)
 
+    def test_started_worker_interruption_is_resumable_without_replaying_task(self) -> None:
+        """已開始的 worker 失敗不能抹成不可接續的終態。
+
+        這是純 synthetic operation：只記錄一個可能已送出的 opaque dispatch，
+        不含網站、瀏覽器或任何特定 Workflow 假設。
+        """
+
+        task = self._dispatched(process_id="proc-recoverable")
+        with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
+            task_features._before_llm(
+                session_id="worker-session",
+                turn_id="worker-turn",
+                user_message=f"{task_marker(task.id)}\n執行 synthetic operation",
+            )
+        self.state.transition_task(
+            task.id,
+            status="running",
+            progress="synthetic dispatch opaque-001 已送出；結果尚待 reconcile。",
+            evidence="Bot explicit bridge_task_update",
+        )
+
+        task_features._on_session_end(
+            session_id="worker-session",
+            turn_id="worker-turn",
+            failed=True,
+            turn_exit_reason="provider_timeout",
+        )
+        settling = self.state.task(task.id)
+        self.assertEqual(settling.status, "settling")
+
+        task_features.settle_task_completion(
+            self.state,
+            task.id,
+            exit_code=1,
+            reason="provider_server_error",
+            origin="synthetic runner",
+        )
+        interrupted = self.state.task(task.id)
+        self.assertEqual(interrupted.status, "interrupted")
+        self.assertTrue(interrupted.resumable)
+        self.assertFalse(interrupted.final)
+        self.assertIn("不會自動重播", interrupted.progress)
+
+    def test_legacy_failed_worker_accepts_late_runner_settlement(self) -> None:
+        task = self._dispatched(process_id="proc-legacy-settlement")
+        with patch.object(task_features, "_current_profile", return_value="operitrace-agent"):
+            task_features._before_llm(
+                session_id="legacy-worker-session",
+                turn_id="legacy-worker-turn",
+                user_message=f"{task_marker(task.id)}\n執行 synthetic operation",
+            )
+        legacy = self.state.transition_task(
+            task.id,
+            status="failed",
+            progress="v0.6.4 premature failure",
+            evidence="hook:on_session_end failed",
+        )
+        self.assertTrue(legacy.resumable)
+
+        settled = task_features.settle_task_completion(
+            self.state,
+            task.id,
+            exit_code=1,
+            reason="provider_server_error",
+            origin="late legacy runner",
+        )
+        self.assertEqual(settled.status, "interrupted")
+        self.assertTrue(settled.resumable)
+        self.assertEqual(settled.exit_code, 1)
+
     def test_hookless_final_output_can_complete_task(self) -> None:
         task = self._dispatched(process_id="proc-hookless")
         notification = (

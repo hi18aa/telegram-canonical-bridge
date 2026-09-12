@@ -1,6 +1,6 @@
 name: telegram-canonical-bridge
 label: Telegram Canonical Bridge
-version: 0.6.4
+version: 0.6.5
 description: 保留 Hermes 原生訊息平台，為主 Agent 提供可追蹤的 canonical Bot 派工 sidecar。
 author: hi18aa
 provides_tools:
