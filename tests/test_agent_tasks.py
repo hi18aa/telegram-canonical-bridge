@@ -319,8 +319,62 @@ class AgentTaskTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-c") + 1], f"TCB Task {task_id}")
         self.assertNotIn("Bot Chat", argv)
         self.assertEqual(argv[argv.index("--source") + 1], "tool")
+        environment = run.call_args.kwargs["environment"]
+        for name in agent_task_runner.EXACT_PAYLOAD_ENV.values():
+            self.assertNotIn(name, environment)
         self.assertFalse(message.exists())
         self.assertEqual(self.state.task(task_id).status, "completed")
+
+    def test_runner_exposes_verified_exact_payload_reference_without_body(self) -> None:
+        task = self._task()
+        exact_text = "逐字正文\n\n兩個空格  與 ⭐⭐"
+        contract = agent_tasks.create_exact_text_payload(
+            self.state_path.parent,
+            task.id,
+            {"text": exact_text},
+        )
+        message = Path(self.temp.name) / "exact-message.txt"
+        message.write_text("只含控制說明", encoding="utf-8")
+        completed = Mock(returncode=0, stdout="done", stderr="")
+        stale = {
+            name: "stale"
+            for name in agent_task_runner.EXACT_PAYLOAD_ENV.values()
+        }
+        with (
+            patch.dict(os.environ, stale),
+            patch.object(
+                agent_task_runner,
+                "_run_worker_command",
+                return_value=(completed, False),
+            ) as run,
+        ):
+            code = agent_task_runner.run([
+                "--target", task.target,
+                "--task-id", task.id,
+                "--state", str(self.state.path),
+                "--message-file", str(message),
+                "--lock-root", str(Path(self.temp.name) / "locks"),
+                "--hermes", "hermes",
+            ])
+        self.assertEqual(code, 0)
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(
+            environment[agent_task_runner.EXACT_PAYLOAD_ENV["artifact_path"]],
+            contract["artifact_path"],
+        )
+        self.assertEqual(
+            environment[agent_task_runner.EXACT_PAYLOAD_ENV["sha256"]],
+            contract["sha256"],
+        )
+        self.assertEqual(
+            environment[agent_task_runner.EXACT_PAYLOAD_ENV["byte_length"]],
+            str(contract["byte_length"]),
+        )
+        exported = {
+            name: environment[name]
+            for name in agent_task_runner.EXACT_PAYLOAD_ENV.values()
+        }
+        self.assertNotIn(exact_text, json.dumps(exported, ensure_ascii=False))
 
     def test_reentered_start_does_not_spawn_duplicate_runner(self) -> None:
         context = _FakeContext()

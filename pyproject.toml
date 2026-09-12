@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telegram-canonical-bridge"
-version = "0.6.3"
+version = "0.6.4"
 description = "為 Hermes 主 Agent 提供可追蹤的 canonical Bot 派工 sidecar"
 requires-python = ">=3.11"
 readme = "README.md"

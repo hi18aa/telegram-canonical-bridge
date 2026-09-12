@@ -25,6 +25,11 @@ from pathlib import Path
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 TASK_ID_RE = re.compile(r"^TCB-[0-9]{8}-[A-F0-9]{6}$", re.IGNORECASE)
 _PLUGIN_TOOLSETS = {"telegram_canonical_bridge"}
+EXACT_PAYLOAD_ENV = {
+    "artifact_path": "HERMES_AGENT_TASK_EXACT_PAYLOAD_PATH",
+    "sha256": "HERMES_AGENT_TASK_EXACT_PAYLOAD_SHA256",
+    "byte_length": "HERMES_AGENT_TASK_EXACT_PAYLOAD_BYTE_LENGTH",
+}
 
 
 class TargetBusyError(TimeoutError):
@@ -130,6 +135,24 @@ def _load_state(state_path: Path):
     return BridgeState(state_path)
 
 
+def _worker_environment(state_path: Path, task_id: str) -> dict[str, str]:
+    """建立單一 worker 的環境；逐字正文仍只存在 artifact，不放入環境。"""
+
+    package_root = Path(__file__).resolve().parent.parent
+    if str(package_root) not in sys.path:
+        sys.path.insert(0, str(package_root))
+    from telegram_canonical_bridge.exact_payload import read_exact_text_payload
+
+    environment = os.environ.copy()
+    for name in EXACT_PAYLOAD_ENV.values():
+        environment.pop(name, None)
+    contract = read_exact_text_payload(state_path.parent, task_id)
+    if contract is not None:
+        for field, name in EXACT_PAYLOAD_ENV.items():
+            environment[name] = str(contract[field])
+    return environment
+
+
 def _cancellation_requested(state, task_id: str) -> bool:
     task = state.task(task_id)
     if task is None:
@@ -156,7 +179,7 @@ def _stop_owned_process_tree(process) -> None:
     process.wait(timeout=5)
 
 
-def _run_worker_command(command, *, state, task_id: str):
+def _run_worker_command(command, *, state, task_id: str, environment=None):
     if _cancellation_requested(state, task_id):
         raise TaskCancelledError("啟動 worker 前收到取消要求")
     # Windows 的 ``communicate(timeout=...)`` 會建立 pipe reader threads；反覆
@@ -165,6 +188,7 @@ def _run_worker_command(command, *, state, task_id: str):
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         process = subprocess.Popen(
             command,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -271,9 +295,15 @@ def run(argv: list[str] | None = None) -> int:
     ]
     try:
         state = _load_state(state_path)
+        worker_environment = _worker_environment(state_path, task_id)
         with _ProfileLock(Path(args.lock_root), target, args.lock_timeout,
                           should_cancel=lambda: _cancellation_requested(state, task_id)):
-            completed, cancelled = _run_worker_command(command, state=state, task_id=task_id)
+            completed, cancelled = _run_worker_command(
+                command,
+                state=state,
+                task_id=task_id,
+                environment=worker_environment,
+            )
         stdout = _filter_plugin_toolset_startup_warning(completed.stdout)
         stderr = _filter_plugin_toolset_startup_warning(completed.stderr)
         busy = (

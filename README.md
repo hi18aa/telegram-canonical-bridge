@@ -25,7 +25,7 @@ Hermes 原生 Telegram 已能穩定處理使用者與主 Agent 之間的文字�
 專門 Bot profile（OT／Research／Publisher／其他）
 ```
 
-## v0.6.3 的核心模式
+## v0.6.4 的核心模式
 
 - 每個派工建立獨立 conversation：`TCB Task <TASK_ID>`。
 - 不再把工作塞進可能正由 Desktop 持有的 canonical `Bot Chat`。
@@ -235,7 +235,7 @@ Hermes 原生 Telegram 仍負責主 Agent 的 typing。背景 Bot 不會偽造�
 <HERMES_ROOT>/plugin-data/telegram-canonical-bridge/exact-payloads/blobs/sha256/<SHA256>/body.utf8.txt
 ```
 
-工具回傳與 `agent_task_status` 都會提供 `artifact_path`、`byte_length`、`sha256`、`manifest_path` 與即時 `verified` 結果。Worker 必須直接讀取 artifact bytes 並核對 digest；不得從 task 對話重建逐字正文。Bridge 的 task marker、`bridge_task_update`、`bridge_task_inbox` 與 completion 指引只留在控制面，正文 artifact 與 manifest 不含這些注入內容。
+工具回傳與 `agent_task_status` 都會提供 `artifact_path`、`byte_length`、`sha256`、`manifest_path` 與即時 `verified` 結果。Worker 必須直接讀取 artifact bytes 並核對 digest；不得從 task 對話重建逐字正文。為避免手抄長路徑或雜湊，v0.6.4 也只把 artifact reference 透過 `HERMES_AGENT_TASK_EXACT_PAYLOAD_PATH`、`HERMES_AGENT_TASK_EXACT_PAYLOAD_SHA256` 與 `HERMES_AGENT_TASK_EXACT_PAYLOAD_BYTE_LENGTH` 傳給該次 Worker；環境變數不含正文，無逐字 payload 的任務會清除同名舊值。Bridge 的 task marker、`bridge_task_update`、`bridge_task_inbox` 與 completion 指引只留在控制面，正文 artifact 與 manifest 不含這些注入內容。
 
 `pre_llm_call` 不再對一般 Controller turn 回傳重複的動態派工說明；Controller 指引只由正式 system prompt section 提供。對 worker 則只綁定 task 與記錄啟動證據，不回傳逐 task 控制文字。控制說明位於 handoff 前段，Controller 任務摘要位於後段，而 exact body 完全不進入 handoff conversation。
 
@@ -248,7 +248,7 @@ Hermes 原生 Telegram 仍負責主 Agent 的 typing。背景 Bot 不會偽造�
 - 要停止：必須明確要求取消指定 task，主 Agent 才能呼叫 `agent_task_cancel`。
 - 取消先保存為 `stopping`。同一 Controller 可使用既有程序 handle；不同 Controller 程序由原 runner 讀取取消要求，停止它自己啟動的 worker 程序樹並確認結束。
 - `stopping`／`ok: true` 只表示已接受取消；查到 `cancelled` 才表示停止已確認。較晚的 worker 進度不會把取消要求蓋回 `running`。取消不能回滾已送出的貼文、交易或其他外部副作用，也不能當成允許重送。
-- v0.6.3 不會熱更新升級前已啟動的舊 runner；更新應在任務閒置時進行。舊 runner 找不到 handle 時不可宣稱已停止，也不應手改 ledger 或刪除 lock。
+- v0.6.4 不會熱更新升級前已啟動的舊 runner；更新應在任務閒置時進行。舊 runner 找不到 handle 時不可宣稱已停止，也不應手改 ledger 或刪除 lock。
 - 每個 task 都是新的隔離 conversation，因此不同 Controller／task 不會共用上下文。
 - task conversation 不跨任務累積大量訊息；主 Telegram session 的壓縮仍由 Hermes 原生機制管理。
 
